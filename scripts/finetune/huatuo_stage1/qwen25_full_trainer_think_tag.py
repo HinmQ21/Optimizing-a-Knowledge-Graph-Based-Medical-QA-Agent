@@ -7,25 +7,18 @@ from typing import Any
 
 import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
-
-try:
-    from unsloth import FastLanguageModel
-except ImportError as exc:
-    raise SystemExit(
-        "Missing dependency: unsloth. Install with `pip install unsloth` before using this script."
-    ) from exc
-
-try:
-    from trl import SFTConfig, SFTTrainer
-except ImportError as exc:
-    raise SystemExit(
-        "Missing dependency: trl. Install with `pip install trl` before using this script."
-    ) from exc
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="HuatuoGPT-o1 style stage-1 SFT using Unsloth + TRL SFTTrainer with eval and best-checkpoint selection."
+        description="HuatuoGPT-o1 style stage-1 full SFT with <think>/<answer> tags and assistant-only masked loss."
     )
     parser.add_argument("--model-path", required=True, help="Local model path or HF model id.")
     parser.add_argument(
@@ -44,7 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument("--dataset-num-proc", type=int, default=None)
-    parser.add_argument("--output-dir", default="outputs/huatuo_stage1_qwen25_3b_unsloth_eval")
+
+    parser.add_argument("--output-dir", default="outputs/huatuo_stage1_qwen25_3b_full_trainer_think_tag")
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--num-train-epochs", type=float, default=3.0)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
@@ -54,13 +48,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--logging-steps", type=int, default=10)
-    parser.add_argument("--eval-steps", type=int, default=200)
-    parser.add_argument("--save-steps", type=int, default=200)
+    parser.add_argument("--eval-steps", type=int, default=50)
+    parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--save-total-limit", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+
     parser.add_argument("--report-to", default="none", choices=["none", "wandb"])
-    parser.add_argument("--run-name", default="huatuo-stage1-qwen25-3b-unsloth-eval")
-    parser.add_argument("--wandb-project", default="my-awesome-project")
+    parser.add_argument("--run-name", default="huatuo-stage1-qwen25-3b-think-tag")
+    parser.add_argument("--wandb-project", default="med-qwen2.5-3b-huatuo")
     parser.add_argument(
         "--wandb-entity",
         default="qminhlb-vietnam-national-university-hanoi",
@@ -68,38 +63,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-dir", default=None)
     parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb-tags", nargs="*", default=None)
-    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--dtype", default=None, choices=[None, "float16", "bfloat16"], help="Override model dtype.")
-    parser.add_argument("--lora-r", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--use-rslora", action="store_true")
-    parser.add_argument("--modules-to-save", nargs="*", default=None)
+
     parser.add_argument(
-        "--target-modules",
-        nargs="+",
-        default=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        "--dtype",
+        default=None,
+        choices=[None, "float16", "bfloat16"],
+        help="Override model dtype. Default uses bf16 on supported CUDA, otherwise fp16 on CUDA.",
     )
     parser.add_argument(
-        "--unsloth-gradient-checkpointing",
+        "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use Unsloth gradient checkpointing mode for lower memory usage.",
+        help="Enable gradient checkpointing for lower memory usage during full finetuning.",
     )
-    parser.add_argument("--optim", default="adamw_8bit")
+    parser.add_argument("--optim", default="adamw_torch")
+    parser.add_argument("--dataloader-num-workers", type=int, default=2)
     return parser.parse_args()
 
 
 def load_dataset_maybe_dict(data_path: str, dataset_config: str | None):
     local_path = Path(data_path)
+
     if local_path.exists():
         if local_path.is_file() and local_path.suffix in {".json", ".jsonl"}:
             return load_dataset("json", data_files=str(local_path))
@@ -152,30 +136,10 @@ def resolve_field(example: dict[str, Any], *candidates: str) -> str:
 
 
 def format_completion(example: dict[str, Any]) -> str:
+    """Format the assistant response with <think> and <answer> control tags."""
     cot = resolve_field(example, "Complex_CoT", "complex_cot", "complex_cot_en")
     response = resolve_field(example, "Response", "response", "final_response")
-    return f"## Thinking\n\n{cot}\n\n## Final Response\n\n{response}"
-
-
-def convert_to_conversational_prompt_completion(
-    dataset: Dataset,
-    dataset_num_proc: int | None,
-) -> Dataset:
-    remove_columns = list(dataset.column_names)
-
-    def map_row(example: dict[str, Any]) -> dict[str, Any]:
-        question = resolve_field(example, "Question", "question", "prompt")
-        return {
-            "prompt": [{"role": "user", "content": question}],
-            "completion": [{"role": "assistant", "content": format_completion(example)}],
-        }
-
-    return dataset.map(
-        map_row,
-        remove_columns=remove_columns,
-        num_proc=dataset_num_proc,
-        desc="Formatting dataset for Unsloth SFTTrainer",
-    )
+    return f"<think>\n{cot}\n</think>\n<answer>\n{response}\n</answer>"
 
 
 def resolve_dtype(dtype_name: str | None):
@@ -196,30 +160,181 @@ def bf16_supported() -> bool:
     )
 
 
-def build_model_and_tokenizer(args: argparse.Namespace):
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model_path,
-        max_seq_length=args.max_seq_len,
-        dtype=resolve_dtype(args.dtype),
-        load_in_4bit=args.load_in_4bit,
-    )
-    if tokenizer.pad_token is None:
+def default_torch_dtype(dtype_name: str | None):
+    resolved_dtype = resolve_dtype(dtype_name)
+    if resolved_dtype is not None:
+        return resolved_dtype
+    if bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return None
+
+
+def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
+    resolved_dtype = resolve_dtype(dtype_name)
+    if resolved_dtype == torch.float16:
+        return False, torch.cuda.is_available()
+    if resolved_dtype == torch.bfloat16:
+        return torch.cuda.is_available(), False
+    return bf16_supported(), torch.cuda.is_available() and not bf16_supported()
+
+
+def normalize_special_tokens(tokenizer, model) -> None:
+    vocab = tokenizer.get_vocab()
+
+    if tokenizer.eos_token in {None, "", "<EOS_TOKEN>"}:
+        recovered = None
+        if tokenizer.eos_token_id is not None:
+            try:
+                recovered = tokenizer.convert_ids_to_tokens(tokenizer.eos_token_id)
+            except Exception:
+                recovered = None
+
+        if recovered and recovered not in {"", "<unk>", None, "<EOS_TOKEN>"}:
+            tokenizer.eos_token = recovered
+        elif "<|im_end|>" in vocab:
+            tokenizer.eos_token = "<|im_end|>"
+        else:
+            raise ValueError(
+                f"Could not resolve a valid eos_token. Current eos_token={tokenizer.eos_token!r}, "
+                f"eos_token_id={tokenizer.eos_token_id!r}"
+            )
+
+    if tokenizer.pad_token in {None, "", "<PAD_TOKEN>", "<EOS_TOKEN>"}:
         tokenizer.pad_token = tokenizer.eos_token
+
     tokenizer.padding_side = "right"
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_r,
-        target_modules=args.target_modules,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        use_gradient_checkpointing="unsloth" if args.unsloth_gradient_checkpointing else False,
-        random_state=args.seed,
-        use_rslora=args.use_rslora,
-        modules_to_save=args.modules_to_save,
-    )
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False
+
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+
+def ensure_special_tokens_in_vocab(tokenizer, model) -> None:
+    """Add <think>, </think>, <answer>, </answer> as special tokens if missing."""
+    control_tags = ["<think>", "</think>", "<answer>", "</answer>"]
+    tokens_to_add = [tag for tag in control_tags if tag not in tokenizer.get_vocab()]
+
+    if tokens_to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
+        model.resize_token_embeddings(len(tokenizer))
+        print(f"Added {len(tokens_to_add)} special tokens: {tokens_to_add}")
+    else:
+        print("All control tags already in vocabulary.")
+
+
+def build_model_and_tokenizer(args: argparse.Namespace):
+    model_kwargs: dict[str, Any] = {"trust_remote_code": True}
+    torch_dtype = default_torch_dtype(args.dtype)
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
+
+    normalize_special_tokens(tokenizer, model)
+    ensure_special_tokens_in_vocab(tokenizer, model)
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    print("DEBUG eos_token:", tokenizer.eos_token, tokenizer.eos_token_id)
+    print("DEBUG pad_token:", tokenizer.pad_token, tokenizer.pad_token_id)
+
     return model, tokenizer
+
+
+def render_chat(prompt: str, completion: str, tokenizer) -> tuple[str, str]:
+    prompt_messages = [
+        {"role": "user", "content": prompt},
+    ]
+    full_messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": completion},
+    ]
+
+    has_chat_template = getattr(tokenizer, "chat_template", None)
+
+    if has_chat_template:
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        full_text = tokenizer.apply_chat_template(
+            full_messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    else:
+        prompt_text = f"### User:\n{prompt}\n\n### Assistant:\n"
+        full_text = f"{prompt_text}{completion}"
+
+    return prompt_text, full_text
+
+
+def convert_to_tokenized_chat_dataset(
+    dataset: Dataset,
+    tokenizer,
+    max_length: int,
+    dataset_num_proc: int | None,
+) -> Dataset:
+    remove_columns = list(dataset.column_names)
+
+    def map_row(example: dict[str, Any]) -> dict[str, Any]:
+        question = resolve_field(example, "Question", "question", "prompt")
+        answer = format_completion(example)
+
+        prompt_text, full_text = render_chat(question, answer, tokenizer)
+
+        prompt_ids = tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        full_enc = tokenizer(
+            full_text,
+            add_special_tokens=False,
+        )
+
+        input_ids = full_enc["input_ids"]
+
+        prompt_len = min(len(prompt_ids), len(input_ids))
+        labels = [-100] * prompt_len + input_ids[prompt_len:]
+
+        # Left-truncate to preserve the end of long reasoning chains
+        if len(input_ids) > max_length:
+            input_ids = input_ids[-max_length:]
+            labels = labels[-max_length:]
+
+        attention_mask = [1] * len(input_ids)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    tokenized = dataset.map(
+        map_row,
+        remove_columns=remove_columns,
+        num_proc=dataset_num_proc,
+        desc="Tokenizing dataset with <think>/<answer> tags and assistant-only masked labels",
+    )
+
+    tokenized = tokenized.filter(
+        lambda ex: any(label != -100 for label in ex["labels"]),
+        desc="Filtering fully-masked samples",
+    )
+
+    return tokenized
 
 
 def build_run_config(
@@ -227,6 +342,7 @@ def build_run_config(
     train_base: Dataset,
     eval_base: Dataset,
     output_dir: Path,
+    tokenizer,
 ) -> dict[str, Any]:
     return {
         **vars(args),
@@ -235,11 +351,17 @@ def build_run_config(
         "eval_num_rows": len(eval_base),
         "cuda_available": torch.cuda.is_available(),
         "bf16_enabled": bf16_supported(),
-        "trainer_type": "trl.SFTTrainer + unsloth.FastLanguageModel",
-        "dataset_format": "conversational_prompt_completion",
-        "loss_behavior": "completion_only",
+        "trainer_type": "transformers.Trainer + transformers.AutoModelForCausalLM",
+        "finetuning_mode": "full",
+        "dataset_format": "pretokenized_chat_with_think_answer_tags",
+        "completion_format": "<think>...</think><answer>...</answer>",
+        "loss_behavior": "assistant_only_via_-100_labels",
         "metric_for_best_model": "eval_loss",
         "greater_is_better": False,
+        "tokenizer_eos_token": tokenizer.eos_token,
+        "tokenizer_pad_token": tokenizer.pad_token,
+        "tokenizer_eos_token_id": tokenizer.eos_token_id,
+        "tokenizer_pad_token_id": tokenizer.pad_token_id,
     }
 
 
@@ -265,6 +387,7 @@ def configure_wandb(args: argparse.Namespace, output_dir: Path, run_config: dict
     os.environ["WANDB_MODE"] = args.wandb_mode
     os.environ["WANDB_DIR"] = wandb_dir
     os.environ.setdefault("WANDB_WATCH", "false")
+
     if args.wandb_entity:
         os.environ["WANDB_ENTITY"] = args.wandb_entity
     if args.wandb_tags:
@@ -285,24 +408,29 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    use_bf16, use_fp16 = resolve_training_precision(args.dtype)
 
     train_base, eval_base = build_train_eval_splits(args)
-    run_config = build_run_config(args, train_base, eval_base, output_dir)
+    model, tokenizer = build_model_and_tokenizer(args)
+
+    run_config = build_run_config(args, train_base, eval_base, output_dir, tokenizer)
     save_json(run_config, output_dir / "run_config.json")
     wandb_run = configure_wandb(args, output_dir, run_config)
 
-    train_dataset = convert_to_conversational_prompt_completion(
+    train_dataset = convert_to_tokenized_chat_dataset(
         train_base,
+        tokenizer=tokenizer,
+        max_length=args.max_seq_len,
         dataset_num_proc=args.dataset_num_proc,
     )
-    eval_dataset = convert_to_conversational_prompt_completion(
+    eval_dataset = convert_to_tokenized_chat_dataset(
         eval_base,
+        tokenizer=tokenizer,
+        max_length=args.max_seq_len,
         dataset_num_proc=args.dataset_num_proc,
     )
 
-    model, tokenizer = build_model_and_tokenizer(args)
-
-    training_args = SFTConfig(
+    training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -312,6 +440,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
+        logging_first_step=True,
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
@@ -320,38 +449,42 @@ def main() -> None:
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        bf16=bf16_supported(),
-        fp16=not bf16_supported(),
-        report_to=args.report_to,
+        bf16=use_bf16,
+        fp16=use_fp16,
+        report_to=[] if args.report_to == "none" else ["wandb"],
         run_name=args.run_name,
         seed=args.seed,
-        dataloader_num_workers=2,
-        gradient_checkpointing=args.unsloth_gradient_checkpointing,
+        dataloader_num_workers=args.dataloader_num_workers,
         remove_unused_columns=False,
         lr_scheduler_type="cosine",
-        dataset_num_proc=args.dataset_num_proc,
-        max_length=args.max_seq_len,
-        packing=False,
-        completion_only_loss=True,
-        assistant_only_loss=False,
         optim=args.optim,
     )
 
-    trainer = SFTTrainer(
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        label_pad_token_id=-100,
+        return_tensors="pt",
+    )
+
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,
+        data_collator=data_collator,
     )
-    trainer.train()
+
+    train_result = trainer.train()
     final_metrics = trainer.evaluate()
+
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
 
     best_info = {
         "best_model_checkpoint": trainer.state.best_model_checkpoint,
         "best_metric": trainer.state.best_metric,
+        "train_metrics": train_result.metrics,
         "final_eval_metrics": final_metrics,
     }
     save_json(best_info, output_dir / "best_checkpoint.json")

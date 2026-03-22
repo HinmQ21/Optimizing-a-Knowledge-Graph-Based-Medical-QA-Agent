@@ -251,7 +251,7 @@ def render_chat(prompt: str, completion: str, tokenizer) -> tuple[str, str]:
         prompt_text = tokenizer.apply_chat_template(
             prompt_messages,
             tokenize=False,
-            add_generation_prompt=False,
+            add_generation_prompt=True,
         )
         full_text = tokenizer.apply_chat_template(
             full_messages,
@@ -287,15 +287,19 @@ def convert_to_tokenized_chat_dataset(
         full_enc = tokenizer(
             full_text,
             add_special_tokens=False,
-            truncation=True,
-            max_length=max_length,
         )
 
         input_ids = full_enc["input_ids"]
-        attention_mask = full_enc["attention_mask"]
 
         prompt_len = min(len(prompt_ids), len(input_ids))
         labels = [-100] * prompt_len + input_ids[prompt_len:]
+
+        # Left-truncate to preserve the end of long reasoning chains
+        if len(input_ids) > max_length:
+            input_ids = input_ids[-max_length:]
+            labels = labels[-max_length:]
+
+        attention_mask = [1] * len(input_ids)
 
         return {
             "input_ids": input_ids,
