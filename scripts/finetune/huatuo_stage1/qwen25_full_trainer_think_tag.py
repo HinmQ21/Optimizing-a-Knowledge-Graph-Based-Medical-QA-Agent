@@ -215,19 +215,6 @@ def normalize_special_tokens(tokenizer, model) -> None:
         model.generation_config.pad_token_id = tokenizer.pad_token_id
 
 
-def ensure_special_tokens_in_vocab(tokenizer, model) -> None:
-    """Add <think>, </think>, <answer>, </answer> as special tokens if missing."""
-    control_tags = ["<think>", "</think>", "<answer>", "</answer>"]
-    tokens_to_add = [tag for tag in control_tags if tag not in tokenizer.get_vocab()]
-
-    if tokens_to_add:
-        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-        model.resize_token_embeddings(len(tokenizer))
-        print(f"Added {len(tokens_to_add)} special tokens: {tokens_to_add}")
-    else:
-        print("All control tags already in vocabulary.")
-
-
 def build_model_and_tokenizer(args: argparse.Namespace):
     model_kwargs: dict[str, Any] = {"trust_remote_code": True}
     torch_dtype = default_torch_dtype(args.dtype)
@@ -238,7 +225,6 @@ def build_model_and_tokenizer(args: argparse.Namespace):
     model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
 
     normalize_special_tokens(tokenizer, model)
-    ensure_special_tokens_in_vocab(tokenizer, model)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()

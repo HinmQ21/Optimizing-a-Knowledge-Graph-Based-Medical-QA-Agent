@@ -10,6 +10,7 @@ venv/
 env/
 training_venv312/
 stage2_venv312/
+*.env
 
 # Editor / OS files
 .DS_Store
@@ -22,6 +23,8 @@ dataset/
 data/
 outputs/
 results/
+eval/
+eval_results/
 unsloth_compiled_cache/
 wandb/
 PrimeKG/
@@ -40,3 +43,12 @@ checkpoint-*/
 
 # Doc
 docs/
+
+# Local reference documents
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+
+# Extra local environments
+.venv_flash_gb10/

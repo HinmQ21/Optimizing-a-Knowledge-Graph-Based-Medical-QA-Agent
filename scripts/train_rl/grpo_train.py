@@ -30,7 +30,7 @@ from trl.chat_template_utils import qwen3_schema  # Qwen2.5 uses same <tool_call
 
 from scripts.serve.retrieval_tool import MedicalKnowledgeTool, search_medical_knowledge
 from scripts.train_rl.data_prep import load_medqa
-from scripts.train_rl.reward_fns import answer_reward, format_reward, tool_quality_reward
+from scripts.train_rl.reward_fns import answer_reward, format_reward, tool_quality_reward, enhanced_tool_quality_reward
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +85,11 @@ def parse_args() -> argparse.Namespace:
         help="Load base weights in 4-bit NF4 via bitsandbytes (QLoRA).",
     )
     parser.add_argument("--lora-r", type=int, default=32)
-    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     # GRPO algorithm
-    parser.add_argument("--beta", type=float, default=0.04,
+    parser.add_argument("--beta", type=float, default=0.1,
                         help="KL penalty coefficient (anchors policy to SFT reference).")
     parser.add_argument("--epsilon", type=float, default=0.2,
                         help="PPO clip ratio.")
@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="load_from_disk path to eval dataset (e.g. dataset/MedQA/test).",
     )
-    parser.add_argument("--eval-steps", type=int, default=100,
+    parser.add_argument("--eval-steps", type=int, default=20,
                         help="Run evaluation every N steps.")
     parser.add_argument("--per-device-eval-batch-size", type=int, default=4)
     parser.add_argument("--max-eval-samples", type=int, default=100,
@@ -235,18 +235,6 @@ def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
 # Special token helpers (from qwen25_medreason_full_trainer_think_tag.py)
 # ---------------------------------------------------------------------------
 
-def ensure_special_tokens_in_vocab(tokenizer, model) -> None:
-    """Add <think>, </think>, <answer>, </answer> as special tokens if missing."""
-    control_tags = ["<think>", "</think>", "<answer>", "</answer>"]
-    tokens_to_add = [tag for tag in control_tags if tag not in tokenizer.get_vocab()]
-    if tokens_to_add:
-        tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-        model.resize_token_embeddings(len(tokenizer))
-        print(f"Added {len(tokens_to_add)} special tokens: {tokens_to_add}")
-    else:
-        print("All control tags already in vocabulary.")
-
-
 def normalize_special_tokens(tokenizer, model) -> None:
     """Ensure EOS/PAD tokens are correctly set for Qwen2.5 ChatML."""
     if not getattr(tokenizer, "chat_template", None):
@@ -319,7 +307,6 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     normalize_special_tokens(tokenizer, model)
-    ensure_special_tokens_in_vocab(tokenizer, model)
 
     # TRL 0.29 only auto-detects Qwen3 chat template for tool calling.
     # Qwen2.5 uses the same <tool_call>...</tool_call> format, so qwen3_schema applies.
@@ -349,12 +336,20 @@ def main() -> None:
         ],
     )
 
-    # --- Warmup steps: compute from actual dataset size, not a hardcoded fallback ---
+    # --- Warmup steps: compute from actual dataset size ---
+    # NOTE: TRL GRPOTrainer treats per_device_train_batch_size as the number
+    # of *sequences* (prompts × num_generations).  The number of unique prompts
+    # consumed per micro-batch is  bs // num_generations, so the real number of
+    # optimizer steps per epoch is:
+    #   len(dataset) // ((bs // G) * grad_accum)
     if args.max_steps > 0:
         total_steps = args.max_steps
     else:
+        prompts_per_micro_batch = max(
+            1, args.per_device_train_batch_size // args.num_generations
+        )
         steps_per_epoch = len(train_ds) // (
-            args.per_device_train_batch_size * args.gradient_accumulation_steps
+            prompts_per_micro_batch * args.gradient_accumulation_steps
         )
         total_steps = max(1, steps_per_epoch) * int(args.num_train_epochs)
     warmup_steps = max(1, int(args.warmup_ratio * total_steps))
@@ -388,8 +383,9 @@ def main() -> None:
         scale_rewards="group",
         num_iterations=1,
 
-        # Reward
-        reward_weights=[0.15, 0.7, 0.15],
+        # Reward — rebalanced to prevent tool-calling collapse.
+        # Previous [0.15, 0.70, 0.15] let model shortcut by skipping tools.
+        reward_weights=[0.25, 0.50, 0.25],
 
         # Training
         num_train_epochs=args.num_train_epochs,
