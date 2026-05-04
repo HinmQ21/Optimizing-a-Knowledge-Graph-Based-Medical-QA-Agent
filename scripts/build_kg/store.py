@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from .verbalize import MedicalTemplateEngine
 
@@ -11,6 +12,7 @@ from .verbalize import MedicalTemplateEngine
 class Entity:
     name: str
     entity_type: str  # disease, drug, gene/protein, pathway, ...
+    node_index: Optional[int] = None  # PrimeKG node_index; preserved for feature-file joins
 
 
 @dataclass
@@ -33,30 +35,53 @@ class MedicalHypergraph:
 
 
 def build_hypergraph(
-    all_hyperedges_raw: list[dict], engine: MedicalTemplateEngine
+    all_hyperedges_raw: list[dict],
+    engine: MedicalTemplateEngine,
+    name_to_idx: dict[str, int] | None = None,
 ) -> MedicalHypergraph:
-    """Build MedicalHypergraph from raw aggregated hyperedge dicts."""
+    """Build MedicalHypergraph from raw aggregated hyperedge dicts.
+
+    Args:
+        all_hyperedges_raw: Raw hedge dicts from aggregate_all + feature_hedges.
+        engine:             Verbalization engine.
+        name_to_idx:        Optional name → PrimeKG node_index map (from filtered_kg).
+                            Populated when provided; entities not in the map get None.
+    """
     entities = {}
     hyperedges = []
     entity_to_hedges: dict[str, list[str]] = {}
+    _idx = name_to_idx or {}
 
     for i, he_raw in enumerate(all_hyperedges_raw):
-        desc = engine.verbalize(he_raw)
+        # Use pre-existing description if available (e.g. loaded from saved JSON)
+        desc = he_raw.get('description') or engine.verbalize(he_raw)
 
         # Collect entities based on hyperedge type
+        # Fall back to 'entities' list when loading from saved JSON (neighbors/parts absent)
         if he_raw['type'] == 'neighbor_agg':
-            ent_list = [he_raw['anchor']] + he_raw['neighbors']
-            types = [he_raw['anchor_type']] + he_raw['neighbor_types']
+            if 'neighbors' in he_raw:
+                ent_list = [he_raw['anchor']] + he_raw['neighbors']
+                types = [he_raw['anchor_type']] + he_raw['neighbor_types']
+            else:
+                ent_list = he_raw['entities']
+                types = [he_raw.get('anchor_type', 'unknown')] + ['unknown'] * (len(ent_list) - 1)
         elif he_raw['type'] == 'composite':
             ent_list = he_raw['entities']
-            types = [he_raw['anchor_type']] + ['unknown'] * (len(ent_list) - 1)
+            types = [he_raw.get('anchor_type', 'unknown')] + ['unknown'] * (len(ent_list) - 1)
+        elif he_raw['type'] == 'feature':
+            ent_list = he_raw.get('entities', [he_raw['anchor']])
+            types = [he_raw.get('anchor_type', 'unknown')] * len(ent_list)
         else:  # path
             ent_list = he_raw['entities']
-            types = he_raw['entity_types']
+            types = he_raw.get('entity_types', ['unknown'] * len(ent_list))
 
         for name, etype in zip(ent_list, types):
             if name not in entities:
-                entities[name] = Entity(name=name, entity_type=etype)
+                entities[name] = Entity(
+                    name=name,
+                    entity_type=etype,
+                    node_index=_idx.get(name),
+                )
 
         hedge_id = f"he_{i:06d}"
         he = Hyperedge(
@@ -83,7 +108,12 @@ def save_hypergraph(hg: MedicalHypergraph, path: str = "data/medical_hg.json"):
     """Serialize MedicalHypergraph to JSON."""
     data = {
         "entities": {
-            k: {"name": v.name, "type": v.entity_type} for k, v in hg.entities.items()
+            k: {
+                "name": v.name,
+                "type": v.entity_type,
+                **({"node_index": v.node_index} if v.node_index is not None else {}),
+            }
+            for k, v in hg.entities.items()
         },
         "hyperedges": [
             {

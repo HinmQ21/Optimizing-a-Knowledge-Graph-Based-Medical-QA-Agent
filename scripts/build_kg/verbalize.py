@@ -119,6 +119,9 @@ class MedicalTemplateEngine:
             return self._composite(he)
         if t == 'path':
             return self._path(he)
+        if t == 'feature':
+            # Description already fully verbalized by feature_hedges.py; pass through.
+            return he['description']
         return str(he)
 
     # Anchor-type-specific overrides: (relation, anchor_type) -> templates

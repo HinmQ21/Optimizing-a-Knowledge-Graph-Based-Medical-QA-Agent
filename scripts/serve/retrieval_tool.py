@@ -12,6 +12,7 @@ Retrieval logic:
       └── 4. Deduplicate + return top-k descriptions
 """
 
+import functools
 import json
 import re
 from pathlib import Path
@@ -58,7 +59,8 @@ class MedicalKnowledgeTool:
         inst = cls()
         inst.data_dir = data_dir
 
-        # Encoder on CPU — do not compete with GPU training
+        # Encoder on CUDA — safe for eval; use device='cpu' during GRPO training
+        # to avoid competing with the training model for VRAM
         inst.encoder = SentenceTransformer(
             'abhinand/MedEmbed-large-v0.1', device='cuda'
         )
@@ -334,6 +336,14 @@ def _get_tool() -> MedicalKnowledgeTool:
     return _tool
 
 
+@functools.lru_cache(maxsize=512)
+def _retrieve_cached(query: str) -> str:
+    results = _get_tool().retrieve(query, top_k=5)
+    if not results:
+        return "No relevant knowledge found."
+    return "\n".join(f"- {r}" for r in results)
+
+
 def search_medical_knowledge(query: str) -> str:
     """Search the medical knowledge graph for relevant clinical facts.
 
@@ -346,10 +356,7 @@ def search_medical_knowledge(query: str) -> str:
     Returns:
         Relevant medical knowledge facts from the knowledge graph.
     """
-    results = _get_tool().retrieve(query, top_k=5)
-    if not results:
-        return "No relevant knowledge found."
-    return "\n".join(f"- {r}" for r in results)
+    return _retrieve_cached(query)
 
 
 # ---------------------------------------------------------------------------

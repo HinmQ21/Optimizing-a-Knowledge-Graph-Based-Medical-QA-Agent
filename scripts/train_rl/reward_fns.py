@@ -169,7 +169,13 @@ def tool_quality_reward(completions, **kwargs) -> list[float]:
 import json
 import numpy as np
 
-_TOOL_CALL_JSON_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+# Qwen: <tool_call>{json}</tool_call>
+# Llama native: {json}<|eot_id|> or {json}<|eom_id|>  (plain JSON, no prefix tag)
+_TOOL_CALL_JSON_RE = re.compile(
+    r"(?:<tool_call>|<\|python_tag\|>)\s*(\{.*?\})\s*(?:</tool_call>|<\|eom_id\|>)"
+    r"|(\{(?:[^{}]|\{[^{}]*\})*\})\s*(?:<\|eot_id\|>|<\|eom_id\|>)",
+    re.DOTALL,
+)
 _WORD_RE = re.compile(r"[a-z0-9]{3,}")
 _GROUNDING_STOPS = frozenset({
     "the", "and", "are", "for", "from", "has", "have", "that", "this",
@@ -198,7 +204,9 @@ def _extract_tool_queries(completion: list[dict]) -> list[str]:
         if turn.get("tool_calls"):
             for tc in turn["tool_calls"]:
                 try:
-                    args = tc.get("function", {}).get("arguments", "{}")
+                    fn = tc.get("function", {})
+                    # Qwen uses "arguments", Llama native uses "parameters"
+                    args = fn.get("arguments") or fn.get("parameters", "{}")
                     if isinstance(args, str):
                         args = json.loads(args)
                     q = args.get("query", "")
@@ -206,13 +214,19 @@ def _extract_tool_queries(completion: list[dict]) -> list[str]:
                         queries.append(q)
                 except (json.JSONDecodeError, AttributeError):
                     pass
-        # Raw <tool_call> tags in content (fallback)
+        # Raw tool-call in content: tagged (Qwen/<|python_tag|>) or native Llama JSON
         content = turn.get("content", "")
-        if content and "<tool_call>" in content:
+        has_tool = (
+            "<tool_call>" in content
+            or "<|python_tag|>" in content
+            or ('"name"' in content and '"parameters"' in content)
+        )
+        if content and has_tool:
             for m in _TOOL_CALL_JSON_RE.finditer(content):
                 try:
-                    tc = json.loads(m.group(1))
-                    args = tc.get("arguments", {})
+                    tc = json.loads(m.group(1) or m.group(2))
+                    # Qwen uses "arguments", Llama native uses "parameters"
+                    args = tc.get("arguments") or tc.get("parameters", {})
                     if isinstance(args, str):
                         args = json.loads(args)
                     q = args.get("query", "")
@@ -296,34 +310,40 @@ def enhanced_tool_quality_reward(
             "gt_answer": gt,
         })
 
-    # --- Phase 2: Batch encode with MedEmbed ---
+    # --- Phase 2: Batch encode with MedEmbed (deduped) ---
+    # With G rollouts sharing the same question, "question" and "qa_anchor"
+    # texts are identical across all rollouts. Dedup before encoding so each
+    # unique string is encoded exactly once regardless of group size.
     if encoder is None:
         return [d["base"] for d in batch]
 
-    texts_to_encode = []
+    unique_texts: list[str] = []
+    text_to_idx: dict[str, int] = {}
     text_map: list[tuple[int, str, int]] = []
+
+    def _add(text: str) -> int:
+        if text not in text_to_idx:
+            text_to_idx[text] = len(unique_texts)
+            unique_texts.append(text)
+        return text_to_idx[text]
 
     for i, d in enumerate(batch):
         if d["skip"]:
             continue
         if d["question"]:
-            text_map.append((i, "question", len(texts_to_encode)))
-            texts_to_encode.append(d["question"])
+            text_map.append((i, "question", _add(d["question"])))
         if d["question"] and d["gt_answer"]:
-            text_map.append((i, "qa_anchor", len(texts_to_encode)))
-            texts_to_encode.append(
+            text_map.append((i, "qa_anchor", _add(
                 f"{d['question']} The answer is {d['gt_answer']}"
-            )
+            )))
         for j, q in enumerate(d["queries"]):
-            text_map.append((i, f"query_{j}", len(texts_to_encode)))
-            texts_to_encode.append(q)
+            text_map.append((i, f"query_{j}", _add(q)))
         for j, r in enumerate(d["tool_responses"]):
-            text_map.append((i, f"response_{j}", len(texts_to_encode)))
-            texts_to_encode.append(r[:512])
+            text_map.append((i, f"response_{j}", _add(r[:512])))
 
-    if texts_to_encode:
+    if unique_texts:
         all_embs = encoder.encode(
-            texts_to_encode, normalize_embeddings=True, batch_size=64,
+            unique_texts, normalize_embeddings=True, batch_size=64,
         )
     else:
         all_embs = np.empty((0, 0))

@@ -16,6 +16,15 @@ from transformers import (
     TrainingArguments,
 )
 
+from scripts.utils.model_adapter import (
+    ModelFamily,
+    detect_family,
+    find_assistant_spans,
+    get_model_load_kwargs,
+    get_tokenizer_load_kwargs,
+    normalize_special_tokens,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -30,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         "--model-path",
         default="models/Qwen2.5-3B-Instruct",
         help="Local model path or HF model id.",
+    )
+    parser.add_argument(
+        "--model-family",
+        default="auto",
+        choices=["auto", "qwen", "llama"],
+        help="Model family. 'auto' detects from model path / config.",
     )
     parser.add_argument(
         "--data-path",
@@ -253,59 +268,23 @@ def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
 # Model & tokenizer
 # ---------------------------------------------------------------------------
 
-def normalize_special_tokens(tokenizer, model) -> None:
-    """Setup EOS/PAD tokens. Uses the tokenizer's built-in chat_template (Qwen2.5 ChatML).
-    Raises ValueError if chat_template is missing rather than silently using a wrong fallback."""
-    if not getattr(tokenizer, "chat_template", None):
-        raise ValueError(
-            "tokenizer.chat_template is missing. "
-            "Qwen2.5-3B-Instruct should have a built-in ChatML template. "
-            "Check the model path or tokenizer files."
-        )
-
-    vocab = tokenizer.get_vocab()
-
-    if tokenizer.eos_token in {None, "", "<EOS_TOKEN>"}:
-        recovered = None
-        if tokenizer.eos_token_id is not None:
-            try:
-                recovered = tokenizer.convert_ids_to_tokens(tokenizer.eos_token_id)
-            except Exception:
-                recovered = None
-
-        if recovered and recovered not in {"", "<unk>", None, "<EOS_TOKEN>"}:
-            tokenizer.eos_token = recovered
-        elif "<|im_end|>" in vocab:
-            tokenizer.eos_token = "<|im_end|>"
-        else:
-            raise ValueError(
-                f"Could not resolve a valid eos_token. "
-                f"eos_token={tokenizer.eos_token!r}, eos_token_id={tokenizer.eos_token_id!r}"
-            )
-
-    if tokenizer.pad_token in {None, "", "<PAD_TOKEN>", "<EOS_TOKEN>"}:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "right"
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = False
-
-    if getattr(model, "generation_config", None) is not None:
-        model.generation_config.eos_token_id = tokenizer.eos_token_id
-        model.generation_config.pad_token_id = tokenizer.pad_token_id
-
-
 def build_model_and_tokenizer(args: argparse.Namespace):
+    family: ModelFamily = (
+        detect_family(args.model_path) if args.model_family == "auto" else args.model_family
+    )
+    print(f"Model family: {family}")
+
     torch_dtype = default_torch_dtype(args.dtype)
-    model_kwargs: dict[str, Any] = {"trust_remote_code": True}
+    model_kwargs: dict[str, Any] = {**get_model_load_kwargs(family)}
     if torch_dtype is not None:
         model_kwargs["torch_dtype"] = torch_dtype
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, **get_tokenizer_load_kwargs(family)
+    )
     model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
 
-    normalize_special_tokens(tokenizer, model)
+    normalize_special_tokens(tokenizer, model, family, padding_side="right")
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -315,7 +294,7 @@ def build_model_and_tokenizer(args: argparse.Namespace):
     print("DEBUG eos_token:", tokenizer.eos_token, tokenizer.eos_token_id)
     print("DEBUG pad_token:", tokenizer.pad_token, tokenizer.pad_token_id)
 
-    return model, tokenizer
+    return model, tokenizer, family
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +509,7 @@ def main() -> None:
     use_bf16, use_fp16 = resolve_training_precision(args.dtype)
 
     train_base, eval_base = build_train_eval_splits(args)
-    model, tokenizer = build_model_and_tokenizer(args)
+    model, tokenizer, _family = build_model_and_tokenizer(args)
 
     train_dataset = convert_to_tokenized_chat_dataset(train_base, tokenizer, args)
     eval_dataset = None

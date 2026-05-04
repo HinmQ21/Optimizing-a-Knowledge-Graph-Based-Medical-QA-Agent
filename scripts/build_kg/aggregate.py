@@ -168,9 +168,13 @@ def extract_paths(
             | paths['y_name_h2'].isin(priority_entities)
         ]
         rest = paths[~paths.index.isin(pri.index)]
-        paths = pd.concat(
-            [pri, rest.sample(max(0, limit - len(pri)), random_state=42)]
-        )
+        if len(pri) >= limit:
+            # Priority set alone exceeds limit — sample within priority paths
+            paths = pri.sample(limit, random_state=42)
+        else:
+            paths = pd.concat(
+                [pri, rest.sample(min(max(0, limit - len(pri)), len(rest)), random_state=42)]
+            )
     elif len(paths) > limit:
         paths = paths.sample(limit, random_state=42)
 

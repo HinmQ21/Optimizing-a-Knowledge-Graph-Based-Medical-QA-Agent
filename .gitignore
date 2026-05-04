@@ -21,6 +21,8 @@ stage2_venv312/
 models/
 dataset/
 data/
+data_v0/
+data_v1/
 outputs/
 results/
 eval/
@@ -52,3 +54,5 @@ docs/
 
 # Extra local environments
 .venv_flash_gb10/
+
+vllm_venv312/

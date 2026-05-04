@@ -79,6 +79,24 @@ def validate_intrinsic(hg: dict) -> dict:
     relations = Counter(h['relation'] for h in hedges)
     results['relations_covered'] = dict(relations)
 
+    # 1e. Feature hedge coverage (if present)
+    feature_hedges = [h for h in hedges if h.get('type') == 'feature']
+    if feature_hedges:
+        results['feature_hedge_count'] = len(feature_hedges)
+        results['feature_types'] = dict(Counter(h.get('relation', h.get('feature_type', '')) for h in feature_hedges))
+        # Entities that exist ONLY in feature hedges (not in any relation-based hedge)
+        relation_entities: set[str] = set()
+        for h in hedges:
+            if h.get('type') != 'feature':
+                for ent in h.get('entities', []):
+                    relation_entities.add(ent)
+        feature_only_entities: set[str] = set()
+        for h in feature_hedges:
+            for ent in h.get('entities', []):
+                if ent not in relation_entities:
+                    feature_only_entities.add(ent)
+        results['feature_only_entities'] = len(feature_only_entities)
+
     return results
 
 
@@ -107,6 +125,14 @@ def print_intrinsic(r: dict):
     print(f'  Composite no period: {r["composite_no_period"]}', _pass(r['composite_no_period'] == 0))
     print(f'  Desc length median:  {r["desc_len_median"]:.0f} words')
     print()
+
+    if 'feature_hedge_count' in r:
+        print(f'  Feature hedges:      {r["feature_hedge_count"]:,}')
+        print(f'  Feature-only entities (rescued): {r.get("feature_only_entities", 0):,}')
+        print(f'  Feature types ({len(r["feature_types"])}):')
+        for ft, c in sorted(r['feature_types'].items(), key=lambda x: -x[1]):
+            print(f'    {ft:<35}: {c:,}')
+        print()
 
 
 # ---------------------------------------------------------------------------

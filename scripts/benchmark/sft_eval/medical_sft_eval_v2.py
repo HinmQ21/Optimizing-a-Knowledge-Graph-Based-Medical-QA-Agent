@@ -35,22 +35,24 @@ hf_import_utils._torchvision_available = False
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Tokens that should always be stripped from generated output (ChatML control tokens).
-# Think/answer tags are intentionally excluded so the tag-format parser can use them.
+from scripts.utils.model_adapter import ModelFamily, detect_family, get_strip_tokens
+
+# _CHATML_STRIP_TOKENS is resolved per-run based on model family (set in main()).
+# Default kept for backward-compat imports; overridden in _decode_generated.
 _CHATML_STRIP_TOKENS = {"<|im_start|>", "<|im_end|>", "<|endoftext|>"}
 
 
-def _decode_generated(tokenizer, token_ids, format_type: str) -> str:
+def _decode_generated(tokenizer, token_ids, format_type: str, strip_tokens=None) -> str:
     """Decode generated token IDs, preserving <think>/<answer> tags for tag format.
 
     When format_type == "tag", we must keep <think>, </think>, <answer>, </answer>
     in the decoded text so downstream parsers can extract structured sections.
-    Using skip_special_tokens=True would strip these if they were registered as
-    special tokens (e.g. via add_special_tokens during training).
+    strip_tokens: set of model-specific control tokens to remove (family-specific).
     """
     if format_type == "tag":
+        tokens_to_strip = strip_tokens if strip_tokens is not None else _CHATML_STRIP_TOKENS
         decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
-        for tok in _CHATML_STRIP_TOKENS:
+        for tok in tokens_to_strip:
             decoded = decoded.replace(tok, "")
         return decoded.strip()
     return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
@@ -606,7 +608,12 @@ def run_benchmark(
     dataset_name: str,
     training_style: str,
 ) -> dict:
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    family: ModelFamily = detect_family(str(model_path))
+    strip_tokens = get_strip_tokens(family)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, **{"trust_remote_code": family == "qwen"}
+    )
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -614,7 +621,7 @@ def run_benchmark(
     wants_cuda = device_preference == "cuda" or (
         device_preference == "auto" and torch.cuda.is_available()
     )
-    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": True}
+    load_kwargs = {"torch_dtype": torch.bfloat16, "trust_remote_code": family == "qwen"}
     if wants_cuda:
         load_kwargs["device_map"] = "auto"
 
@@ -668,7 +675,7 @@ def run_benchmark(
 
         prompt_len = inputs["input_ids"].shape[1]
         for idx, norm in enumerate(rows):
-            decoded = _decode_generated(tokenizer, outputs[idx][prompt_len:], format_type)
+            decoded = _decode_generated(tokenizer, outputs[idx][prompt_len:], format_type, strip_tokens)
             pred, parse_source = adapter.parse(decoded, norm, final_section_re, format_type)
             fallback_used = False
             fallback_output = None

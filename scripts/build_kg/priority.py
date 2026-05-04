@@ -46,15 +46,29 @@ def build_priority_entities(
     priority = {kg_lower[t.lower()] for t in candidate_terms if t.lower() in kg_lower}
     print(f"  Exact matches: {len(priority):,}")
 
-    # Fuzzy match for the rest
+    # Fuzzy match for the rest — batch via cdist (parallel, much faster than loop)
     unmatched = [t for t in candidate_terms if t.lower() not in kg_lower]
+    # Skip very long terms (>6 words); KG entity names are almost always ≤5 words
+    unmatched = [t for t in unmatched if len(t.split()) <= 6]
     kg_list = list(kg_entity_names)
     fuzzy_hits = 0
-    for term in unmatched:
-        result = fuzz_process.extractOne(term, kg_list)
-        if result and result[1] >= fuzzy_threshold:
-            priority.add(result[0])
-            fuzzy_hits += 1
+    if unmatched:
+        import numpy as np
+        from rapidfuzz import fuzz
+        # cdist: shape (len(unmatched), len(kg_list)), workers=-1 uses all CPU cores
+        scores = fuzz_process.cdist(
+            unmatched, kg_list,
+            scorer=fuzz.WRatio,
+            score_cutoff=fuzzy_threshold,
+            workers=-1,
+        )
+        # For each query term, pick the best-matching KG entity (if any passed cutoff)
+        best_idx = np.argmax(scores, axis=1)
+        best_scores = scores[np.arange(len(unmatched)), best_idx]
+        for i, (score, kg_idx) in enumerate(zip(best_scores, best_idx)):
+            if score >= fuzzy_threshold:
+                priority.add(kg_list[kg_idx])
+                fuzzy_hits += 1
     print(f"  Fuzzy matches: {fuzzy_hits:,}")
     print(f"  Total priority entities: {len(priority):,}")
 

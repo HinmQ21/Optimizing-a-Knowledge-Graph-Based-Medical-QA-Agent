@@ -1,27 +1,70 @@
-"""Step 7: GRPO training for medical reasoning with knowledge retrieval.
+"""GRPO training with vLLM-accelerated rollout generation.
 
-Trains a SFT checkpoint (Qwen2.5-3B or Llama-3.2-3B-Instruct) using TRL GRPOTrainer.
-The model learns to:
-  1. Call search_medical_knowledge tool for relevant KG facts
-  2. Reason in <think>...</think> blocks
-  3. Answer in <answer>...</answer> blocks (concise MCQ letter)
+Same reward design, LoRA config, and tool-calling setup as grpo_train.py,
+but adds TRL's built-in vLLM colocate mode for the generation phase.
+Run with ./vllm_venv312/bin/python (not training_venv312).
+
+vLLM colocate mode mechanics:
+  - A vLLM LLM engine lives in the same process as the training model.
+  - Before each optimizer step, TRL merges LoRA weights and syncs them to vLLM.
+  - vLLM generates all G rollouts per prompt in a single batched call — this is
+    10–30× faster than HF model.generate() for large generation batch sizes.
+  - enable_sleep_mode offloads vLLM weights to CPU/disk during backward.
+    WARNING: vLLM 0.20.0 sleep(level=2) reloads from safetensors on disk every
+    wake_up() call (~34s overhead per step) — SLOWER than baseline. Default off.
+    On GB10's 120 GB unified memory, sleep mode is unnecessary.
+  - Tool calling (_tool_call_loop) is fully supported in colocate mode.
+    (vllm_mode="server" raises NotImplementedError when tools are passed.)
+
+Expected speedup (sleep mode OFF):
+  Rollout generation is typically 70–80% of GRPO wall time.
+  vLLM acceleration of that phase → ~3–5× overall reduction.
+  4–5 days on GB10 → ~1–2 days.
+
+Memory profile (GB10, 120 GB unified, sleep OFF):
+  Training model + LoRA + optimizer states : ~35 GB
+  vLLM engine (base model weights + KV cache at util=0.5) : ~66 GB
+  Total peak (both resident simultaneously) : ~101 GB — within 120 GB.
 
 Usage:
     cd /home/vcsai/minhlbq/baseline
-    ./training_venv312/bin/python -m scripts.train_rl.grpo_train \
-        --model-path outputs/medreason_stage2_from_huatuo_qwen25_3b \
-        --data-path dataset/MedQA/train \
-        --data-dir data/ \
-        --output-dir outputs/grpo_medical \
-        --max-completion-length 2048 \
-        --report-to wandb \
-        --run-name grpo-medical-kg
+
+    # Dry run — verify setup (no checkpoint saved)
+    ./vllm_venv312/bin/python -m scripts.train_rl.grpo_train_vllm \\
+        --model-path outputs/stage1_5_tool_sft_v2_merged \\
+        --max-steps 10 --max-eval-samples 10 \\
+        --per-device-train-batch-size 1 \\
+        --use-vllm
+
+    # Full training (vLLM enabled, recommended)
+    ./vllm_venv312/bin/python -m scripts.train_rl.grpo_train_vllm \\
+        --model-path outputs/stage1_5_tool_sft_v2_merged \\
+        --output-dir outputs/grpo_medical_lora_v6_vllm \\
+        --data-dir data/ \\
+        --use-vllm --vllm-gpu-mem-util 0.5 \\
+        --num-generations 8 \\
+        --report-to wandb --run-name grpo-medical-v6-vllm
+
+    # Fallback: no vLLM (same behavior as grpo_train.py, uses training_venv312 args)
+    ./vllm_venv312/bin/python -m scripts.train_rl.grpo_train_vllm \\
+        --model-path outputs/stage1_5_tool_sft_v2_merged \\
+        --output-dir outputs/grpo_medical_lora_v6 \\
+        --data-dir data/
 """
 
 import argparse
 import os
+import warnings
 from pathlib import Path
 from typing import Any
+
+# TRL's vLLM version check is conservative (lists 0.10-0.12) but TRL 0.29.1
+# internally targets the V1 API available in 0.6+. vLLM 0.20.0 is compatible.
+warnings.filterwarnings(
+    "ignore",
+    message="TRL currently supports vLLM versions",
+    category=UserWarning,
+)
 
 import torch
 from peft import LoraConfig
@@ -38,7 +81,7 @@ from scripts.utils.model_adapter import (
     normalize_special_tokens,
 )
 from scripts.train_rl.data_prep import load_medqa
-from scripts.train_rl.reward_fns import answer_reward, format_reward, tool_quality_reward, enhanced_tool_quality_reward
+from scripts.train_rl.reward_fns import answer_reward, format_reward, enhanced_tool_quality_reward
 from scripts.train_rl.reward_fns_gdpo import (
     answer_reward as gdpo_answer_reward,
     structure_reward,
@@ -53,70 +96,48 @@ from scripts.train_rl.reward_fns_gdpo import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "GRPO training for medical reasoning with knowledge-graph retrieval. "
-            "Trains LoRA adapters on top of a Stage 1/2 SFT checkpoint. "
-            "Uses TRL GRPOTrainer with in-process tool calling."
+            "GRPO training with vLLM colocate acceleration. "
+            "Adds --use-vllm flag on top of grpo_train.py; all other args identical. "
+            "Run with ./vllm_venv312/bin/python."
         )
     )
 
     # Model
     parser.add_argument(
         "--model-path",
-        default="outputs/medreason_stage2_from_huatuo_qwen25_3b",
-        help="Path to Stage 1/2 SFT checkpoint (local) or HF model id.",
+        default="outputs/stage1_5_tool_sft_v2_merged",
+        help="Path to Stage 1.5 SFT merged checkpoint.",
     )
     parser.add_argument(
         "--model-family",
         default="auto",
         choices=["auto", "qwen", "llama"],
-        help=(
-            "Model family for family-specific token handling and tool format. "
-            "'auto' detects from model path / config (default)."
-        ),
     )
 
     # Data
-    parser.add_argument(
-        "--data-path",
-        default="dataset/MedQA/train",
-        help="load_from_disk path to training dataset (MedQA or MedMCQA).",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default="data/",
-        help="Directory containing FAISS indices and medical_hg.json for retrieval tool.",
-    )
-    parser.add_argument(
-        "--max-train-samples",
-        type=int,
-        default=None,
-        help="Cap number of training examples (for quick ablations).",
-    )
+    parser.add_argument("--data-path", default="dataset/MedQA/train")
+    parser.add_argument("--data-dir", default="data/")
+    parser.add_argument("--max-train-samples", type=int, default=None)
 
     # Output
-    parser.add_argument(
-        "--output-dir",
-        default="outputs/grpo_medical",
-    )
+    parser.add_argument("--output-dir", default="outputs/grpo_medical_vllm")
 
     # QLoRA / LoRA
     parser.add_argument(
         "--load-in-4bit",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Load base weights in 4-bit NF4 via bitsandbytes (QLoRA).",
+        help="QLoRA: load base weights in 4-bit NF4 via bitsandbytes.",
     )
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     # GRPO algorithm
-    parser.add_argument("--beta", type=float, default=0.1,
-                        help="KL penalty coefficient (anchors policy to SFT reference).")
-    parser.add_argument("--epsilon", type=float, default=0.2,
-                        help="PPO clip ratio.")
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--num-generations", type=int, default=4,
-                        help="Number of rollouts (G) per prompt.")
+                        help="Rollouts G per prompt. With vLLM, G=8 is cheap — try it.")
     parser.add_argument("--max-completion-length", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--max-tool-calling-iterations", type=int, default=3)
@@ -126,61 +147,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-device-train-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--lr-scheduler-type", default="cosine",
-                        help="LR scheduler type (default: cosine).")
+    parser.add_argument("--lr-scheduler-type", default="cosine")
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--max-steps", type=int, default=-1,
-                        help="Override num_train_epochs. Use 1 for a dry run.")
+    parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
 
     # Evaluation
-    parser.add_argument(
-        "--eval-data-path",
-        default=None,
-        help="load_from_disk path to eval dataset (e.g. dataset/MedQA/test).",
-    )
-    parser.add_argument("--eval-steps", type=int, default=20,
-                        help="Run evaluation every N steps.")
+    parser.add_argument("--eval-data-path", default=None)
+    parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--per-device-eval-batch-size", type=int, default=4)
-    parser.add_argument("--max-eval-samples", type=int, default=100,
-                        help="Cap eval examples (GRPO eval is slow due to generation).")
+    parser.add_argument("--max-eval-samples", type=int, default=100)
 
     # Logging / saving
-    parser.add_argument("--logging-steps", type=int, default=5)
+    parser.add_argument("--logging-steps", type=int, default=15)
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument(
-        "--report-to",
-        default="none",
-        choices=["none", "wandb", "tensorboard"],
+        "--report-to", default="none", choices=["none", "wandb", "tensorboard"]
     )
-    parser.add_argument("--run-name", default="grpo-medical-kg")
+    parser.add_argument("--run-name", default="grpo-medical-vllm")
     parser.add_argument("--wandb-project", default="MedGRPO")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument(
-        "--wandb-mode",
-        default="offline",
-        choices=["online", "offline", "disabled"],
+        "--wandb-mode", default="offline", choices=["online", "offline", "disabled"]
     )
 
     # Precision
-    parser.add_argument(
-        "--dtype",
-        default=None,
-        choices=[None, "float16", "bfloat16"],
-    )
+    parser.add_argument("--dtype", default=None, choices=[None, "float16", "bfloat16"])
 
-    # Native generation speedups (no vLLM required)
+    # HF generation options (used when --use-vllm is off)
     parser.add_argument(
         "--attn-implementation",
         default="sdpa",
         choices=["sdpa", "eager", "flash_attention_2"],
         help=(
-            "Attention implementation for model loading. "
-            "'sdpa' (default) uses PyTorch's fused scaled_dot_product_attention — "
-            "no extra install needed, works on GB10. "
-            "'flash_attention_2' requires `pip install flash-attn` and sm>=8.0."
+            "Attention backend for the HF training model's backward pass. "
+            "Not used by the vLLM engine (which picks its own kernel). "
+            "'sdpa' works on GB10 without extra packages."
         ),
     )
     parser.add_argument(
@@ -188,44 +192,88 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Batch size for rollout generation. "
-            "Defaults to per_device_train_batch_size × num_generations. "
-            "Increase to improve GPU utilization during generation "
-            "(at the cost of more peak VRAM)."
+            "Total rollout sequences per generation phase. In TRL this affects "
+            "both HF and vLLM paths by setting steps_per_generation; must be "
+            "divisible by num_generations and the global train batch size."
         ),
     )
-    parser.add_argument(
-        "--torch-empty-cache-steps",
-        type=int,
-        default=None,
-        help=(
-            "Call torch.cuda.empty_cache() every N steps. "
-            "Helps reclaim fragmented VRAM on long runs (e.g. --torch-empty-cache-steps 50)."
-        ),
-    )
-    parser.add_argument(
-        "--dataloader-num-workers",
-        type=int,
-        default=4,
-        help="DataLoader worker processes (default 4). Set 0 to disable.",
-    )
-    parser.add_argument(
-        "--dataloader-prefetch-factor",
-        type=int,
-        default=2,
-        help="Number of batches to prefetch per DataLoader worker (default 2).",
-    )
+    parser.add_argument("--torch-empty-cache-steps", type=int, default=None)
+    parser.add_argument("--dataloader-num-workers", type=int, default=4)
+    parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
 
-    # GDPO
+    # GDPO variant
     parser.add_argument(
         "--use-gdpo",
         action="store_true",
         default=False,
+        help="Use GDPO reward design (orthogonal structure/answer/tool rewards).",
+    )
+
+    # ── vLLM acceleration ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        default=False,
         help=(
-            "Use GDPO reward design: orthogonal (structure, answer, tool) rewards "
-            "with multi_objective_aggregation='normalize_then_sum'. "
-            "Replaces format_reward + enhanced_tool_quality_reward with "
-            "structure_reward + tool_reward to remove tool-call signal overlap."
+            "Enable vLLM colocate mode for rollout generation. "
+            "Requires ./vllm_venv312/bin/python. "
+            "3–5× faster training; does not change reward design or LoRA config."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-gpu-mem-util",
+        type=float,
+        default=0.5,
+        help=(
+            "vLLM gpu_memory_utilization (0–1). Fraction of GPU VRAM reserved "
+            "for vLLM KV cache during the generation phase. "
+            "Default 0.5 leaves ~60 GB for training model + LoRA + optimizer; "
+            "both resident simultaneously on GB10's 120 GB unified memory."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=6144,
+        help=(
+            "vLLM max_model_len: max total tokens (prompt + completion + tool turns). "
+            "Default 6144 covers system prompt (~500) + question (~200) + "
+            "3 tool rounds (~1000) + max_completion_length (2048). "
+            "Increase if you see 'Input too long' errors."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-sleep-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable vLLM sleep mode (default OFF). "
+            "WARNING: vLLM 0.20.0 sleep(level=2) reloads weights from disk on "
+            "every wake_up(), adding ~34s overhead per step — SLOWER than baseline. "
+            "On GB10 (120 GB unified) the two peaks fit without sleep mode. "
+            "Only enable if you hit OOM with sleep=off."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-model-impl",
+        default="vllm",
+        choices=["vllm", "transformers"],
+        help=(
+            "vLLM model implementation backend. "
+            "'vllm' (default) uses vLLM's optimised CUDA kernels. "
+            "'transformers' uses HF model inside vLLM — useful for debugging."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-stop-at-tags",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --use-vllm is set, stop generation as soon as </tool_call> "
+            "or </answer> is generated, while keeping the stop string in the "
+            "output. This prevents over-generation past a tool call so TRL can "
+            "parse and execute the tool. Use --no-vllm-stop-at-tags to restore "
+            "the old behavior."
         ),
     )
 
@@ -233,7 +281,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Dtype helpers (same pattern as medreason SFT scripts)
+# Dtype helpers (identical to grpo_train.py)
 # ---------------------------------------------------------------------------
 
 def bf16_supported() -> bool:
@@ -257,16 +305,12 @@ def default_torch_dtype(dtype_name: str | None):
 
 
 def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
-    """Returns (bf16, fp16) tuple for TrainingArguments."""
     dtype = default_torch_dtype(dtype_name)
     if dtype == torch.float16:
         return False, torch.cuda.is_available()
     if dtype == torch.bfloat16:
         return torch.cuda.is_available(), False
     return bf16_supported(), torch.cuda.is_available() and not bf16_supported()
-
-
-# normalize_special_tokens is imported from scripts.utils.model_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -283,13 +327,27 @@ def main() -> None:
             os.environ.setdefault("WANDB_ENTITY", args.wandb_entity)
         os.environ.setdefault("WANDB_MODE", args.wandb_mode)
 
+    # --- Print config banner ---
+    vllm_label = (
+        f"vLLM colocate  gpu_mem={args.vllm_gpu_mem_util}  "
+        f"max_len={args.vllm_max_model_len}  sleep={args.vllm_sleep_mode}  "
+        f"impl={args.vllm_model_impl}"
+        if args.use_vllm else "HF transformers (no vLLM)"
+    )
+    print(f"\n{'='*60}")
+    print(f"GRPO training  [{vllm_label}]")
+    print(f"  model:  {args.model_path}")
+    print(f"  output: {args.output_dir}")
+    print(f"  G={args.num_generations}  lr={args.learning_rate}  β={args.beta}")
+    print(f"{'='*60}\n")
+
     # --- Detect model family ---
     family: ModelFamily = (
         detect_family(args.model_path) if args.model_family == "auto" else args.model_family
     )
     print(f"Model family: {family}")
 
-    # --- Pre-load retrieval tool with correct data_dir ---
+    # --- Pre-load retrieval tool ---
     print(f"Pre-loading retrieval tool from {args.data_dir} ...")
     MedicalKnowledgeTool.load(data_dir=args.data_dir)
     print("Retrieval tool ready.")
@@ -317,9 +375,6 @@ def main() -> None:
     )
 
     normalize_special_tokens(tokenizer, model, family, padding_side="left")
-
-    # Set response schema so TRL can parse tool calls during GRPO rollouts.
-    # Qwen: <tool_call>...</tool_call>  |  Llama: <|python_tag|>...<|eom_id|>
     tokenizer.response_schema = get_trl_response_schema(family)
 
     # --- Dataset ---
@@ -346,12 +401,10 @@ def main() -> None:
         ],
     )
 
-    # --- Warmup steps: compute from actual dataset size ---
-    # NOTE: TRL GRPOTrainer treats per_device_train_batch_size as the number
-    # of *sequences* (prompts × num_generations).  The number of unique prompts
-    # consumed per micro-batch is  bs // num_generations, so the real number of
-    # optimizer steps per epoch is:
-    #   len(dataset) // ((bs // G) * grad_accum)
+    # --- Warmup steps ---
+    # Same calculation as grpo_train.py: TRL treats per_device_train_batch_size
+    # as total sequences (prompts × G), so unique prompts per micro-step =
+    # batch_size // G.
     if args.max_steps > 0:
         total_steps = args.max_steps
     else:
@@ -367,9 +420,28 @@ def main() -> None:
 
     # --- GRPOConfig ---
     use_bf16, use_fp16 = resolve_training_precision(args.dtype)
-
-    # DataLoader prefetch: only meaningful when num_workers > 0
     prefetch = args.dataloader_prefetch_factor if args.dataloader_num_workers > 0 else None
+
+    # vLLM colocate params — only injected when --use-vllm is set.
+    # When off, GRPOConfig falls back to HF model.generate() exactly as in grpo_train.py.
+    vllm_config: dict[str, Any] = {}
+    if args.use_vllm:
+        generation_kwargs: dict[str, Any] | None = None
+        if args.vllm_stop_at_tags:
+            generation_kwargs = {
+                "stop": ["</tool_call>", "</answer>"],
+                "include_stop_str_in_output": True,
+            }
+        vllm_config = dict(
+            use_vllm=True,
+            vllm_mode="colocate",
+            vllm_enable_sleep_mode=args.vllm_sleep_mode,
+            vllm_gpu_memory_utilization=args.vllm_gpu_mem_util,
+            vllm_max_model_length=args.vllm_max_model_len,
+            vllm_model_impl=args.vllm_model_impl,
+            vllm_tensor_parallel_size=1,  # single GPU on GB10
+            generation_kwargs=generation_kwargs,
+        )
 
     training_args = GRPOConfig(
         output_dir=args.output_dir,
@@ -378,35 +450,21 @@ def main() -> None:
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
-        # generation_batch_size: how many prompts × generations to run at once.
-        # None → trainer uses per_device_train_batch_size × num_generations.
-        # Larger values improve GPU utilization but need more VRAM.
+        # TRL uses this to derive steps_per_generation for both HF and vLLM.
         generation_batch_size=args.generation_batch_size,
 
         # Tool calling
         max_tool_calling_iterations=args.max_tool_calling_iterations,
 
         # RL algorithm
-        # GDPO uses "dapo" (length-unbiased) as recommended pairing.
-        # GRPO keeps original "grpo" to avoid unintended behavioral change.
         loss_type="dapo" if args.use_gdpo else "grpo",
         beta=args.beta,
         epsilon=args.epsilon,
         scale_rewards="group",
         num_iterations=1,
-
-        # Multi-reward aggregation:
-        #   GRPO (default): sum_then_normalize — combine weighted rewards, then normalize.
-        #   GDPO (--use-gdpo): normalize_then_sum — normalize each reward independently,
-        #       then combine. Requires orthogonal reward design (reward_fns_gdpo.py).
         multi_objective_aggregation=(
             "normalize_then_sum" if args.use_gdpo else "sum_then_normalize"
         ),
-
-        # Reward weights:
-        #   GRPO: [0.25 format, 0.50 answer, 0.25 tool_quality]
-        #   GDPO: [0.20 structure, 0.50 answer, 0.30 tool] — tool weight increased
-        #       because structure_reward no longer shares tool-call gradient.
         reward_weights=[0.20, 0.50, 0.30] if args.use_gdpo else [0.25, 0.50, 0.25],
 
         # Training
@@ -425,22 +483,17 @@ def main() -> None:
         eval_steps=args.eval_steps if eval_ds is not None else None,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
 
-        # Optimizer: adamw_torch_fused uses CUDA-fused kernel → ~5-10% faster
-        # than standard AdamW. Default in TRL 0.29.1 GRPOConfig.
+        # Optimizer
         optim="adamw_torch_fused",
 
         # Memory
         gradient_checkpointing=True,
-        # Recompute activations with fused attention to save VRAM during backward.
         gradient_checkpointing_kwargs={"use_reentrant": False},
         bf16=use_bf16,
         fp16=use_fp16,
-
-        # VRAM management: empty CUDA cache periodically to reduce fragmentation
         torch_empty_cache_steps=args.torch_empty_cache_steps,
 
-        # DataLoader: parallel workers + prefetch to keep GPU fed during rollouts.
-        # MedQA dataset is in Arrow format (memory-mapped) so workers are safe.
+        # DataLoader
         dataloader_num_workers=args.dataloader_num_workers,
         dataloader_prefetch_factor=prefetch,
         dataloader_pin_memory=torch.cuda.is_available(),
@@ -454,6 +507,9 @@ def main() -> None:
         save_total_limit=args.save_total_limit,
         report_to=args.report_to,
         run_name=args.run_name,
+
+        # vLLM colocate (empty dict → no-op when --use-vllm not set)
+        **vllm_config,
     )
 
     # --- Trainer ---

@@ -40,6 +40,16 @@ from transformers import (
 
 import json
 
+from scripts.utils.model_adapter import (
+    ModelFamily,
+    detect_family,
+    find_assistant_spans,
+    get_model_load_kwargs,
+    get_tokenizer_load_kwargs,
+    get_tools_for_template,
+    normalize_special_tokens,
+)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -61,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-split", type=float, default=0.05,
                    help="Fraction of data for eval split.")
     p.add_argument("--max-seq-len", type=int, default=2048)
+
+    # Model family
+    p.add_argument(
+        "--model-family",
+        default="auto",
+        choices=["auto", "qwen", "llama"],
+        help="Model family for chat template / token handling. 'auto' detects from path.",
+    )
 
     # Output
     p.add_argument("--output-dir", default="outputs/stage1_5_tool_sft")
@@ -130,32 +148,7 @@ def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
     return bf16_supported(), torch.cuda.is_available() and not bf16_supported()
 
 
-# ---------------------------------------------------------------------------
-# Special tokens (same as grpo_train.py)
-# ---------------------------------------------------------------------------
-
-def normalize_special_tokens(tokenizer, model) -> None:
-    if not getattr(tokenizer, "chat_template", None):
-        raise ValueError("tokenizer.chat_template is missing.")
-
-    vocab = tokenizer.get_vocab()
-    if tokenizer.eos_token in {None, "", "<EOS_TOKEN>"}:
-        if "<|im_end|>" in vocab:
-            tokenizer.eos_token = "<|im_end|>"
-        else:
-            raise ValueError(f"Cannot resolve eos_token: {tokenizer.eos_token!r}")
-
-    if tokenizer.pad_token in {None, "", "<PAD_TOKEN>", "<EOS_TOKEN>"}:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "right"  # Right-pad for SFT (causal LM)
-    model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = False
-
-    if getattr(model, "generation_config", None) is not None:
-        model.generation_config.eos_token_id = tokenizer.eos_token_id
-        model.generation_config.pad_token_id = tokenizer.pad_token_id
+# normalize_special_tokens and find_assistant_spans imported from model_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -172,47 +165,9 @@ def load_traces(path: str) -> list[dict]:
     return traces
 
 
-def find_assistant_spans(token_ids: list[int], tokenizer) -> list[tuple[int, int]]:
-    """Find (start, end) token index spans for assistant content.
-
-    Qwen2.5 ChatML format:
-      <|im_start|>assistant\n ... <|im_end|>
-
-    We train on tokens between '<|im_start|>assistant\\n' and '<|im_end|>'
-    for each assistant turn. System, user, and tool tokens are masked.
-    """
-    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-    # Tokenize "assistant\n" to get the suffix tokens after <|im_start|>
-    assistant_marker_ids = tokenizer.encode("assistant\n", add_special_tokens=False)
-
-    spans = []
-    i = 0
-    while i < len(token_ids):
-        if token_ids[i] == im_start_id:
-            # Check if this is an assistant turn
-            marker_end = i + 1 + len(assistant_marker_ids)
-            if (marker_end <= len(token_ids)
-                    and token_ids[i + 1: marker_end] == assistant_marker_ids):
-                # Content starts after the marker
-                content_start = marker_end
-                # Find the closing <|im_end|>
-                content_end = content_start
-                while content_end < len(token_ids) and token_ids[content_end] != im_end_id:
-                    content_end += 1
-                # Include <|im_end|> in the span (model should learn to stop)
-                if content_end < len(token_ids):
-                    content_end += 1
-                spans.append((content_start, content_end))
-                i = content_end
-                continue
-        i += 1
-
-    return spans
 
 
-def tokenize_trace(trace: dict, tokenizer, max_seq_len: int) -> dict | None:
+def tokenize_trace(trace: dict, tokenizer, max_seq_len: int, family: ModelFamily = "qwen") -> dict | None:
     """Tokenize a multi-turn trace with assistant-only loss masking.
 
     All tokens are kept as input_ids, but labels are -100 for everything
@@ -224,9 +179,10 @@ def tokenize_trace(trace: dict, tokenizer, max_seq_len: int) -> dict | None:
     """
     messages = trace["messages"]
 
-    # Apply chat template to get full text
+    # Apply chat template — pass tools= for Llama so tool definition enters user msg
     text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False,
+        messages, tools=get_tools_for_template(family),
+        tokenize=False, add_generation_prompt=False,
     )
 
     # Tokenize
@@ -239,7 +195,7 @@ def tokenize_trace(trace: dict, tokenizer, max_seq_len: int) -> dict | None:
 
     # Build labels: -100 everywhere except assistant spans
     labels = [-100] * len(input_ids)
-    spans = find_assistant_spans(input_ids, tokenizer)
+    spans = find_assistant_spans(input_ids, tokenizer, family)
     for start, end in spans:
         for j in range(start, min(end, len(input_ids))):
             labels[j] = input_ids[j]
@@ -255,12 +211,12 @@ def tokenize_trace(trace: dict, tokenizer, max_seq_len: int) -> dict | None:
     }
 
 
-def build_dataset(traces: list[dict], tokenizer, max_seq_len: int) -> Dataset:
+def build_dataset(traces: list[dict], tokenizer, max_seq_len: int, family: ModelFamily = "qwen") -> Dataset:
     """Convert list of traces to a HuggingFace Dataset with tokenized fields."""
     records = []
     skipped = 0
     for trace in traces:
-        result = tokenize_trace(trace, tokenizer, max_seq_len)
+        result = tokenize_trace(trace, tokenizer, max_seq_len, family)
         if result is None:
             skipped += 1
             continue
@@ -350,17 +306,25 @@ def main() -> None:
     if args.report_to == "wandb":
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
 
+    # --- Detect model family ---
+    family: ModelFamily = (
+        detect_family(args.model_path) if args.model_family == "auto" else args.model_family
+    )
+    print(f"Model family: {family}")
+
     # --- Model & tokenizer ---
     print(f"Loading model from {args.model_path} ...")
     torch_dtype = default_torch_dtype(args.dtype)
-    model_kwargs: dict[str, Any] = {"trust_remote_code": True}
+    model_kwargs: dict[str, Any] = {**get_model_load_kwargs(family)}
     if torch_dtype is not None:
         model_kwargs["torch_dtype"] = torch_dtype
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, **get_tokenizer_load_kwargs(family)
+    )
 
-    normalize_special_tokens(tokenizer, model)
+    normalize_special_tokens(tokenizer, model, family, padding_side="right")
 
     # --- LoRA ---
     peft_config = LoraConfig(
@@ -383,7 +347,7 @@ def main() -> None:
     print(f"Loaded {len(traces)} traces")
 
     print("Tokenizing traces ...")
-    full_ds = build_dataset(traces, tokenizer, args.max_seq_len)
+    full_ds = build_dataset(traces, tokenizer, args.max_seq_len, family)
     print(f"Tokenized dataset: {len(full_ds)} samples")
 
     # Token stats

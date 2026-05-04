@@ -34,21 +34,34 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from scripts.serve.retrieval_tool import MedicalKnowledgeTool, search_medical_knowledge
 from scripts.train_rl.data_prep import SYSTEM_PROMPT
+from scripts.utils.model_adapter import (
+    detect_family,
+    get_eos_for_generation,
+    get_model_load_kwargs,
+    get_tool_call_regex,
+    get_tokenizer_load_kwargs,
+    get_tool_response_message,
+    get_tools_for_template,
+    normalize_special_tokens,
+    strip_generation_artifacts,
+)
 
 
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
 
+# _TOOL_CALL_RE is set per-run via get_tool_call_regex(family) after model load.
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 _LETTER_RE = re.compile(r"^\s*([A-Ea-e])[.\):\s]")
 
 
-def extract_tool_calls(text: str) -> list[dict]:
+def extract_tool_calls(text: str, tool_re=None) -> list[dict]:
+    pattern = tool_re if tool_re is not None else _TOOL_CALL_RE
     calls = []
-    for m in _TOOL_CALL_RE.finditer(text):
+    for m in pattern.finditer(text):
         try:
             calls.append(json.loads(m.group(1)))
         except json.JSONDecodeError:
@@ -92,7 +105,8 @@ def generate_with_tools(
 
     for iteration in range(max_tool_iterations + 1):
         text = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False,
+            messages, tools=get_tools_for_template(_EVAL_FAMILY),
+            add_generation_prompt=True, tokenize=False,
         )
         enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
         input_ids = enc["input_ids"].to(model.device)
@@ -104,34 +118,29 @@ def generate_with_tools(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature, do_sample=temperature > 0,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=get_eos_for_generation(_EVAL_FAMILY, tokenizer),
             )
-        generated = tokenizer.decode(
-            out[0][input_ids.shape[1]:], skip_special_tokens=False,
-        ).replace("<|im_end|>", "").strip()
-
-        tool_calls = extract_tool_calls(generated)
+        # Extract tool calls from raw text BEFORE stripping (terminators required by regex)
+        raw_text = tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=False)
+        tool_re = get_tool_call_regex(_EVAL_FAMILY)
+        tool_calls = extract_tool_calls(raw_text, tool_re)
+        generated = strip_generation_artifacts(raw_text, _EVAL_FAMILY)
         if tool_calls and iteration < max_tool_iterations:
             messages.append({"role": "assistant", "content": generated})
             tool_calls_made.extend(tool_calls)
             for tc in tool_calls:
                 try:
-                    args = tc.get("arguments", {})
+                    # Qwen uses "arguments", Llama uses "parameters"
+                    args = tc.get("arguments") or tc.get("parameters", {})
                     if isinstance(args, str):
                         args = json.loads(args)
                     query = args.get("query", "")
                     result = search_medical_knowledge(query)
                     tool_responses.append(result)
-                    messages.append({
-                        "role": "user",
-                        "content": f"<tool_response>\n{result}\n</tool_response>",
-                    })
+                    messages.append(get_tool_response_message(result, _EVAL_FAMILY))
                 except Exception as e:
                     tool_responses.append(f"ERROR: {e}")
-                    messages.append({
-                        "role": "user",
-                        "content": f"<tool_response>\nERROR: {e}\n</tool_response>",
-                    })
+                    messages.append(get_tool_response_message(f"ERROR: {e}", _EVAL_FAMILY))
         else:
             messages.append({"role": "assistant", "content": generated})
             break
@@ -163,11 +172,17 @@ def score_retrieval_relevance(encoder, question: str, answer_text: str,
     return float(sims.max())
 
 
+# Module-level family: set in main() before generate_with_tools is called.
+_EVAL_FAMILY = "qwen"
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _EVAL_FAMILY
+
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", required=True)
     p.add_argument("--data-path", default="dataset/MedQA/test")
@@ -179,7 +194,16 @@ def main() -> None:
     p.add_argument("--output", default=None, help="Optional JSON output path")
     p.add_argument("--score-retrieval", action="store_true",
                    help="Score retrieval relevance with MedEmbed (slower)")
+    p.add_argument(
+        "--model-family", default="auto", choices=["auto", "qwen", "llama"],
+        help="Model family for token format. 'auto' detects from path.",
+    )
     args = p.parse_args()
+
+    _EVAL_FAMILY = (
+        detect_family(args.model_path) if args.model_family == "auto" else args.model_family
+    )
+    print(f"Model family: {_EVAL_FAMILY}")
 
     # Load retrieval tool
     print("Loading KG retrieval tool ...")
@@ -187,13 +211,14 @@ def main() -> None:
 
     # Load model
     print(f"Loading model from {args.model_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path, **get_tokenizer_load_kwargs(_EVAL_FAMILY)
+    )
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, dtype=torch.bfloat16,
-        trust_remote_code=True, device_map="auto",
+        args.model_path, torch_dtype=torch.bfloat16,
+        device_map="auto", **get_model_load_kwargs(_EVAL_FAMILY),
     ).eval()
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    normalize_special_tokens(tokenizer, model, _EVAL_FAMILY, padding_side="left")
 
     # Load eval data
     print(f"Loading eval data from {args.data_path} ...")

@@ -237,9 +237,18 @@ def tool_reward(
     encoder = _get_encoder()
 
     # --- Phase 1: Extract per-completion data ---
+    _TOOL_CALL_TEXT_RE = re.compile(r"<tool_call>")
+
     batch = []
     for i, completion in enumerate(completions):
-        n_calls = sum(1 for t in completion if t.get("tool_calls"))
+        # Count structured tool_calls (OpenAI-style) OR text-based <tool_call> (Qwen3-style)
+        n_calls = sum(
+            1 for t in completion
+            if t.get("tool_calls") or (
+                t.get("role") == "assistant"
+                and _TOOL_CALL_TEXT_RE.search(t.get("content", ""))
+            )
+        )
 
         if n_calls == 0:
             batch.append({"base": -0.40, "skip": True})
