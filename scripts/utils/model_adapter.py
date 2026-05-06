@@ -60,7 +60,9 @@ QWEN_TOOL_SCHEMA: dict = {
 }
 
 # Llama: {"name":…,"parameters":{…}}<|eot_id|>   (plain JSON, no python_tag prefix)
-# Uses "parameters" key (Llama native); reward_fns handles both keys.
+# Llama's native chat template emits `parameters`, but TRL's _validate_tool_calls
+# and _tool_call_loop strictly require `arguments`. The JMESPath transform below
+# renames parameters → arguments so the parsed structure is TRL-compatible.
 LLAMA_TOOL_SCHEMA: dict = {
     "x-regex": (
         r"^(?:<think>\n?(?:(?P<reasoning_content>.*?\S.*?)\n?|[\s]*)</think>\s*)?"
@@ -78,7 +80,9 @@ LLAMA_TOOL_SCHEMA: dict = {
             "x-regex-iterator": r"(\{(?:[^{}]|\{[^{}]*\})*\})\s*(?:<\|eot_id\|>|<\|eom_id\|>)",
             "items": {
                 "x-parser": "json",
-                "x-parser-args": {"transform": "{type: 'function', function: @}"},
+                "x-parser-args": {
+                    "transform": "{type: 'function', function: {name: name, arguments: parameters}}"
+                },
                 "type": "object",
                 "properties": {
                     "type": {"const": "function"},
@@ -86,7 +90,7 @@ LLAMA_TOOL_SCHEMA: dict = {
                         "type": "object",
                         "properties": {
                             "name": {"type": "string"},
-                            "parameters": {"type": "object", "additionalProperties": {}},
+                            "arguments": {"type": "object", "additionalProperties": {}},
                         },
                     },
                 },

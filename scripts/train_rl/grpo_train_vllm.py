@@ -54,9 +54,12 @@ Usage:
 
 import argparse
 import os
+import re
 import warnings
 from pathlib import Path
 from typing import Any
+
+from transformers import TrainerCallback
 
 # TRL's vLLM version check is conservative (lists 0.10-0.12) but TRL 0.29.1
 # internally targets the V1 API available in 0.6+. vLLM 0.20.0 is compatible.
@@ -269,11 +272,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "When --use-vllm is set, stop generation as soon as </tool_call> "
-            "or </answer> is generated, while keeping the stop string in the "
-            "output. This prevents over-generation past a tool call so TRL can "
-            "parse and execute the tool. Use --no-vllm-stop-at-tags to restore "
-            "the old behavior."
+            "When --use-vllm is set, stop generation as soon as a family-specific "
+            "tool-call terminator or </answer> is generated, while keeping the "
+            "stop string in the output. This prevents over-generation past a "
+            "tool call so TRL can parse and execute the tool. Use "
+            "--no-vllm-stop-at-tags to restore the old behavior."
         ),
     )
 
@@ -311,6 +314,86 @@ def resolve_training_precision(dtype_name: str | None) -> tuple[bool, bool]:
     if dtype == torch.bfloat16:
         return torch.cuda.is_available(), False
     return bf16_supported(), torch.cuda.is_available() and not bf16_supported()
+
+
+def get_vllm_stop_strings(family: ModelFamily) -> list[str]:
+    """Keep vLLM generation aligned with the family-specific tool syntax."""
+    if family == "llama":
+        return ["<|eom_id|>", "<|eot_id|>", "</answer>"]
+    return ["</tool_call>", "</answer>"]
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test callback
+# ---------------------------------------------------------------------------
+
+_RAW_TOOL_JSON_RE = re.compile(
+    r'"name"\s*:\s*"search_medical_knowledge"', re.DOTALL
+)
+
+
+class ToolParserSmokeTest(TrainerCallback):
+    """Abort training if the tool parser is silently broken.
+
+    Symptom: the model emits raw tool-call JSON in completions, but TRL's
+    `tools/call_frequency` metric stays at 0 — meaning `parse_response` failed
+    validation and dropped the structured `tool_calls`. Running 50h on this is
+    pure waste, so we fail-fast at step `abort_after_step`.
+
+    Trigger: after step `abort_after_step`, if `tools/call_frequency == 0`
+    AND >= `raw_json_threshold` of the latest completions parquet contain raw
+    tool JSON, raise RuntimeError.
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        abort_after_step: int = 10,
+        raw_json_threshold: float = 0.30,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.abort_after_step = abort_after_step
+        self.raw_json_threshold = raw_json_threshold
+        self.triggered = False
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.triggered or logs is None:
+            return
+        if state.global_step < self.abort_after_step:
+            return
+        call_freq = logs.get("tools/call_frequency")
+        if call_freq is None or call_freq > 0:
+            return  # parser is working
+
+        comp_dir = self.output_dir / "completions"
+        if not comp_dir.exists():
+            return  # nothing to inspect yet
+        parquets = sorted(comp_dir.glob("completions_*.parquet"))
+        if not parquets:
+            return
+        try:
+            import pandas as pd
+            df = pd.read_parquet(parquets[-1])
+        except Exception:
+            return  # don't fail on inspection error
+
+        if "completion" not in df.columns or len(df) == 0:
+            return
+        raw_json_freq = (
+            df["completion"].astype(str).str.contains(_RAW_TOOL_JSON_RE).mean()
+        )
+        if raw_json_freq >= self.raw_json_threshold:
+            self.triggered = True
+            raise RuntimeError(
+                f"\n[SMOKE TEST FAILED] step={state.global_step}, "
+                f"raw tool-JSON in {raw_json_freq:.0%} of completions "
+                f"but tools/call_frequency=0.\n"
+                f"  → Tool parser is dropping tool_calls during "
+                f"_validate_tool_calls.\n"
+                f"  → Check LLAMA_TOOL_SCHEMA in scripts/utils/model_adapter.py: "
+                f"function.arguments must be present (not parameters).\n"
+                f"  → Latest parquet: {parquets[-1]}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +512,7 @@ def main() -> None:
         generation_kwargs: dict[str, Any] | None = None
         if args.vllm_stop_at_tags:
             generation_kwargs = {
-                "stop": ["</tool_call>", "</answer>"],
+                "stop": get_vllm_stop_strings(family),
                 "include_stop_str_in_output": True,
             }
         vllm_config = dict(
@@ -508,6 +591,10 @@ def main() -> None:
         report_to=args.report_to,
         run_name=args.run_name,
 
+        # Pin Today Date so Llama's tool template renders deterministically
+        # across runs (default would interpolate today's system date).
+        chat_template_kwargs={"date_string": "26 December 2024"},
+
         # vLLM colocate (empty dict → no-op when --use-vllm not set)
         **vllm_config,
     )
@@ -526,6 +613,7 @@ def main() -> None:
         ),
         tools=[search_medical_knowledge],
         peft_config=peft_config,
+        callbacks=[ToolParserSmokeTest(args.output_dir)],
     )
 
     # --- Train ---

@@ -7,11 +7,13 @@ The 'answer' column is preserved so TRL can pass it to answer_reward().
 from datasets import Dataset, load_from_disk
 
 SYSTEM_PROMPT = (
-    "You are a medical reasoning assistant with access to "
-    "a search_medical_knowledge tool.\n\n"
-    "Structure your response:\n"
-    "1. <think>Your reasoning here</think>\n"
-    "2. Optionally call search_medical_knowledge tool between think blocks\n"
+    "You are a medical reasoning assistant with access to a "
+    "search_medical_knowledge tool.\n\n"
+    "Structure your response in this order:\n"
+    "1. <think>Your initial reasoning about the question</think>\n"
+    "2. (Optional) If you need to verify a medical fact, call "
+    "search_medical_knowledge, then add another <think>...</think> "
+    "incorporating the result.\n"
     "3. <answer>Your final answer</answer>\n\n"
     "IMPORTANT: In <answer> tags, write ONLY the option letter (e.g. A) "
     "or a short answer, NOT an explanation."

@@ -39,7 +39,11 @@ _FINAL_LETTER_RE = re.compile(
     r"(?:\*\*)?([A-Ea-e])\b",
     re.IGNORECASE,
 )
-_TOOL_CALL_JSON_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_JSON_RE = re.compile(
+    r"(?:<tool_call>|<\|python_tag\|>)\s*(\{.*?\})\s*(?:</tool_call>|<\|eom_id\|>)"
+    r"|(\{(?:[^{}]|\{[^{}]*\})*\})\s*(?:<\|eot_id\|>|<\|eom_id\|>)",
+    re.DOTALL,
+)
 _WORD_RE = re.compile(r"[a-z0-9]{3,}")
 _GROUNDING_STOPS = frozenset({
     "the", "and", "are", "for", "from", "has", "have", "that", "this",
@@ -179,7 +183,8 @@ def _extract_tool_queries(completion: list[dict]) -> list[str]:
         if turn.get("tool_calls"):
             for tc in turn["tool_calls"]:
                 try:
-                    args = tc.get("function", {}).get("arguments", "{}")
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments") or fn.get("parameters", "{}")
                     if isinstance(args, str):
                         args = json.loads(args)
                     q = args.get("query", "")
@@ -188,11 +193,16 @@ def _extract_tool_queries(completion: list[dict]) -> list[str]:
                 except (json.JSONDecodeError, AttributeError):
                     pass
         content = turn.get("content", "")
-        if content and "<tool_call>" in content:
+        has_tool = (
+            "<tool_call>" in content
+            or "<|python_tag|>" in content
+            or ('"name"' in content and '"parameters"' in content)
+        )
+        if content and has_tool:
             for m in _TOOL_CALL_JSON_RE.finditer(content):
                 try:
-                    tc = json.loads(m.group(1))
-                    args = tc.get("arguments", {})
+                    tc = json.loads(m.group(1) or m.group(2))
+                    args = tc.get("arguments") or tc.get("parameters", {})
                     if isinstance(args, str):
                         args = json.loads(args)
                     q = args.get("query", "")
@@ -237,7 +247,9 @@ def tool_reward(
     encoder = _get_encoder()
 
     # --- Phase 1: Extract per-completion data ---
-    _TOOL_CALL_TEXT_RE = re.compile(r"<tool_call>")
+    _TOOL_CALL_TEXT_RE = re.compile(
+        r"<tool_call>|<\|python_tag\|>|\"name\"\s*:\s*\"search_medical_knowledge\""
+    )
 
     batch = []
     for i, completion in enumerate(completions):

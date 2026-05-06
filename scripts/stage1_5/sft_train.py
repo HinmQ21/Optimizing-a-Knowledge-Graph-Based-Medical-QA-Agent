@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     # Training
     p.add_argument("--num-train-epochs", type=float, default=3.0)
     p.add_argument("--per-device-train-batch-size", type=int, default=4)
-    p.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=2e-5)
     p.add_argument("--lr-scheduler-type", default="cosine")
     p.add_argument("--warmup-ratio", type=float, default=0.05)

@@ -109,6 +109,7 @@ Per-sample SC fields:
 """
 
 import argparse
+import importlib
 import json
 import re
 import time
@@ -599,6 +600,30 @@ class MultiEndingProcessor(LogitsProcessor):
 ForceAnswerProcessor = MultiEndingProcessor
 
 
+def _tool_end_markers(family: ModelFamily) -> list[str]:
+    """Return textual endings that close a tool-call generation for a family."""
+    if family == "llama":
+        return ["<|eom_id|>", "<|eot_id|>"]
+    return ["</tool_call>"]
+
+
+def _force_answer_stop_strings(family: ModelFamily, final_only: bool) -> list[str]:
+    """Stop strings that are also valid EOS-gating endings for one turn."""
+    if final_only:
+        return ["</answer>"]
+    return _tool_end_markers(family) + ["</answer>"]
+
+
+def _encode_end_markers(tokenizer, markers: list[str]) -> list[list[int]]:
+    """Encode ending markers, dropping any marker that is not in the tokenizer."""
+    endings: list[list[int]] = []
+    for marker in markers:
+        ids = tokenizer.encode(marker, add_special_tokens=False)
+        if ids:
+            endings.append(ids)
+    return endings
+
+
 # ---------------------------------------------------------------------------
 # Batched generation helper
 # ---------------------------------------------------------------------------
@@ -623,7 +648,7 @@ def _run_batched_generation(
 
     EOS-suppression endings (via MultiEndingProcessor) are picked per-iteration:
       - no_tool, or last iteration in tool mode → only </answer> allowed to end
-      - intermediate tool iteration            → </tool_call> OR </answer> allowed
+      - intermediate tool iteration            → family tool-end OR </answer>
     `min_new_tokens` is defence-in-depth only and defaults to 0.
     """
     from scripts.utils.model_adapter import strip_generation_artifacts
@@ -631,8 +656,8 @@ def _run_batched_generation(
     tool_re = get_tool_call_regex(family)
     eos = get_eos_for_generation(family, tokenizer)
     eos_ids_list = [eos] if isinstance(eos, int) else list(eos)
-    answer_end_ids = tokenizer.encode("</answer>", add_special_tokens=False)
-    tool_end_ids = tokenizer.encode("</tool_call>", add_special_tokens=False)
+    answer_endings = _encode_end_markers(tokenizer, ["</answer>"])
+    tool_endings = _encode_end_markers(tokenizer, _tool_end_markers(family))
     orig_padding_side = tokenizer.padding_side
 
     for iteration in range(max_tool_iterations + 1):
@@ -662,12 +687,12 @@ def _run_batched_generation(
         # Pick valid endings for this iteration:
         #   - no_tool                   → only </answer>
         #   - last iteration in tool    → only </answer> (tool quota exhausted)
-        #   - intermediate tool iter    → </tool_call> OR </answer>
+        #   - intermediate tool iter    → family tool-end OR </answer>
         if force_answer:
             if no_tool or iteration == max_tool_iterations:
-                endings = [answer_end_ids]
+                endings = answer_endings
             else:
-                endings = [tool_end_ids, answer_end_ids]
+                endings = tool_endings + answer_endings
             lp = LogitsProcessorList(
                 [MultiEndingProcessor(endings, eos_ids_list)]
             )
@@ -693,7 +718,7 @@ def _run_batched_generation(
             raw = tokenizer.decode(out[batch_pos][prompt_len:], skip_special_tokens=False)
             generated = strip_generation_artifacts(raw, family)
 
-            tool_calls = extract_tool_calls(generated, tool_re) if not no_tool else []
+            tool_calls = extract_tool_calls(raw, tool_re) if not no_tool else []
 
             if tool_calls and iteration < max_tool_iterations:
                 state["messages"].append({"role": "assistant", "content": generated})
@@ -723,84 +748,107 @@ def _run_batched_generation(
 # vLLM generation path (separate venv: vllm_venv312)
 # ---------------------------------------------------------------------------
 
+try:
+    from vllm.v1.sample.logits_processor import AdapterLogitsProcessor as _VllmAdapterLogitsProcessor
+except Exception:
+    _VllmAdapterLogitsProcessor = object
+
+
+class VllmForceAnswerLP(_VllmAdapterLogitsProcessor):
+    """Suppress EOS tokens until a valid family-specific ending appears.
+
+    This class must be module-level. vLLM may force multiprocessing `spawn`,
+    and nested classes cannot be pickled into worker processes.
+    """
+
+    # Marker strings whose presence in SamplingParams.stop activates the LP.
+    # Mapped to their token-id sequences in __init__.
+    _ENDING_MARKERS: tuple[str, ...] = (
+        "</answer>",
+        "</tool_call>",
+        "<|eom_id|>",
+        "<|eot_id|>",
+    )
+
+    def __init__(self, vllm_config, device, is_pin_memory):
+        if _VllmAdapterLogitsProcessor is object:
+            raise RuntimeError("vLLM is required to use VllmForceAnswerLP.")
+        super().__init__(vllm_config, device, is_pin_memory)
+        from transformers import AutoTokenizer
+        model_path = vllm_config.model_config.model
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # marker -> token-id sequence, picklable for multi-proc executor.
+        self._end_ids_by_marker: dict[str, list[int]] = {
+            m: list(tok.encode(m, add_special_tokens=False))
+            for m in self._ENDING_MARKERS
+        }
+        # Aggregate EOS-like ids: tokenizer + hf_config.
+        eos_set: set[int] = set()
+        if tok.eos_token_id is not None:
+            eos_set.add(int(tok.eos_token_id))
+        hf_eos = getattr(vllm_config.model_config.hf_config, "eos_token_id", None)
+        if isinstance(hf_eos, int):
+            eos_set.add(hf_eos)
+        elif isinstance(hf_eos, (list, tuple)):
+            eos_set.update(int(x) for x in hf_eos)
+        self._eos_ids: list[int] = sorted(eos_set)
+
+    def is_argmax_invariant(self) -> bool:
+        return False  # may flip argmax via EOS suppression
+
+    def new_req_logits_processor(self, params):
+        stop = params.stop or ()
+        # Endings active for this request = intersection of markers and stop.
+        endings: list[list[int]] = [
+            self._end_ids_by_marker[m]
+            for m in self._ENDING_MARKERS
+            if m in stop
+        ]
+        if not endings:
+            return None  # caller did not ask for force-answer
+        endings.sort(key=len, reverse=True)
+        max_end_len = len(endings[0])
+
+        # Suppress every EOS variant + per-request stop token ids.
+        stop_tids = list(set(self._eos_ids) | set(params.all_stop_token_ids or []))
+
+        def lp(output_ids, logits):
+            if len(output_ids) >= 1:  # cheap early-out
+                tail = (
+                    list(output_ids[-max_end_len:])
+                    if len(output_ids) >= max_end_len
+                    else list(output_ids)
+                )
+                for ending in endings:
+                    elen = len(ending)
+                    if len(tail) >= elen and tail[-elen:] == ending:
+                        return logits  # valid ending at tail -> allow EOS
+            for tid in stop_tids:
+                logits[tid] = float("-inf")
+            return logits
+
+        return lp
+
+
 def get_vllm_force_answer_lp_class(tokenizer=None):
     """Return an AdapterLogitsProcessor class that suppresses EOS tokens until
     one of the per-request "valid endings" appears at the tail of generation.
     vLLM equivalent of MultiEndingProcessor.
 
     Valid endings are signalled per-request via the `stop` field:
-      - stop=['</answer>']                       → only </answer> allowed
-      - stop=['</tool_call>', '</answer>']       → either ending allowed
+      - stop=['</answer>']                               → only </answer> allowed
+      - stop=['</tool_call>', '</answer>']               → Qwen tool or answer
+      - stop=['<|eom_id|>', '<|eot_id|>', '</answer>']   → Llama tool or answer
     A request without either string in `stop` opts out (LP returns None).
 
-    The class is self-contained — it reloads the tokenizer in __init__ from
+    The class is self-contained: it reloads the tokenizer in __init__ from
     vllm_config.model_config.model so no closure variables need to survive
     multi-process executor pickling. The `tokenizer` arg is unused (kept for
     API compatibility).
     """
-    from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
-
-    class VllmForceAnswerLP(AdapterLogitsProcessor):
-        # Marker strings whose presence in SamplingParams.stop activates the LP.
-        # Mapped to their token-id sequences in __init__.
-        _ENDING_MARKERS: tuple[str, ...] = ("</answer>", "</tool_call>")
-
-        def __init__(self, vllm_config, device, is_pin_memory):
-            super().__init__(vllm_config, device, is_pin_memory)
-            from transformers import AutoTokenizer
-            model_path = vllm_config.model_config.model
-            tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            # marker → token-id sequence, picklable for multi-proc executor.
-            self._end_ids_by_marker: dict[str, list[int]] = {
-                m: list(tok.encode(m, add_special_tokens=False))
-                for m in self._ENDING_MARKERS
-            }
-            # Aggregate EOS-like ids — tokenizer + hf_config.
-            eos_set: set[int] = set()
-            if tok.eos_token_id is not None:
-                eos_set.add(int(tok.eos_token_id))
-            hf_eos = getattr(vllm_config.model_config.hf_config, "eos_token_id", None)
-            if isinstance(hf_eos, int):
-                eos_set.add(hf_eos)
-            elif isinstance(hf_eos, (list, tuple)):
-                eos_set.update(int(x) for x in hf_eos)
-            self._eos_ids: list[int] = sorted(eos_set)
-
-        def is_argmax_invariant(self) -> bool:
-            return False  # may flip argmax via EOS suppression
-
-        def new_req_logits_processor(self, params):
-            stop = params.stop or ()
-            # Endings active for this request = intersection of markers and stop.
-            endings: list[list[int]] = [
-                self._end_ids_by_marker[m]
-                for m in self._ENDING_MARKERS
-                if m in stop
-            ]
-            if not endings:
-                return None  # caller didn't ask for force-answer
-            endings.sort(key=len, reverse=True)
-            max_end_len = len(endings[0])
-
-            # Suppress every EOS variant + per-request stop token ids.
-            stop_tids = list(set(self._eos_ids) | set(params.all_stop_token_ids or []))
-
-            def lp(output_ids, logits):
-                if len(output_ids) >= 1:  # cheap early-out
-                    tail = (
-                        list(output_ids[-max_end_len:])
-                        if len(output_ids) >= max_end_len
-                        else list(output_ids)
-                    )
-                    for ending in endings:
-                        elen = len(ending)
-                        if len(tail) >= elen and tail[-elen:] == ending:
-                            return logits  # valid ending at tail → allow EOS
-                for tid in stop_tids:
-                    logits[tid] = float("-inf")
-                return logits
-            return lp
-
+    if __name__ == "__main__":
+        module = importlib.import_module("scripts.benchmark.grpo_eval.grpo_eval")
+        return module.VllmForceAnswerLP
     return VllmForceAnswerLP
 
 
@@ -821,7 +869,7 @@ def _run_vllm_generation(
     Per-iteration stop strings (also used by VllmForceAnswerLP to decide which
     endings allow EOS):
       - no_tool, or last iteration in tool mode → stop=['</answer>']
-      - intermediate tool iteration             → stop=['</tool_call>', '</answer>']
+      - intermediate tool iteration             → family tool-end OR </answer>
     `min_tokens` is defence-in-depth and only applied on force-answer iterations
     (never on intermediate tool iterations, where it would cause the model to
     over-generate past a short </tool_call>).
@@ -854,7 +902,7 @@ def _run_vllm_generation(
                 stop_strs = ["</answer>"]
                 is_force_answer_iter = True
             else:
-                stop_strs = ["</tool_call>", "</answer>"]
+                stop_strs = _force_answer_stop_strings(family, final_only=False)
                 is_force_answer_iter = False
         else:
             stop_strs = None
@@ -871,6 +919,7 @@ def _run_vllm_generation(
             min_tokens=cur_min,
             stop=stop_strs,
             include_stop_str_in_output=True,
+            skip_special_tokens=False,
             n=1,
         )
 
@@ -878,11 +927,10 @@ def _run_vllm_generation(
 
         for batch_pos, sample_idx in enumerate(active_idx):
             state = states[sample_idx]
-            generated = strip_generation_artifacts(
-                outputs[batch_pos].outputs[0].text, family
-            )
+            raw_generated = outputs[batch_pos].outputs[0].text
+            generated = strip_generation_artifacts(raw_generated, family)
 
-            tool_calls = extract_tool_calls(generated, tool_re) if not no_tool else []
+            tool_calls = extract_tool_calls(raw_generated, tool_re) if not no_tool else []
 
             if tool_calls and iteration < max_tool_iterations:
                 state["messages"].append({"role": "assistant", "content": generated})
