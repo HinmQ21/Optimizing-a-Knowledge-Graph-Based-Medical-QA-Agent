@@ -1079,6 +1079,7 @@ def eval_benchmark(
     vllm_force_answer: bool = True,
     vllm_min_tokens: int = 0,
     vllm_chunk_size: int = 256,
+    save_completions: bool = False,
 ) -> dict:
     """Run inference on one benchmark split and return metrics + per_sample list.
 
@@ -1275,6 +1276,14 @@ def eval_benchmark(
             "avg_query_copy_paste": avg_copy_paste,
             "retrieval_score": retrieval_score,
         }
+
+        if save_completions:
+            entry["question"] = ex["question"]
+            entry["options"] = ex["options"]
+            entry["answer_text"] = ex["answer"]
+            entry["final_content"] = final_content
+            entry["tool_responses"] = res.get("tool_responses", [])
+            entry["messages"] = res.get("messages", [])
 
         if sc_meta is not None:
             greedy_pred = sc_meta["greedy_pred"]
@@ -1481,6 +1490,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--save-completions", action="store_true",
+        help=(
+            "Dump full conversation messages, final_content, and tool_responses "
+            "into per_sample entries. Greatly increases output JSON size (~5-10x). "
+            "Use for qualitative analysis / picking illustrative examples."
+        ),
+    )
+    p.add_argument(
         "--vllm-enforce-eager", action="store_true",
         help=(
             "Pass enforce_eager=True to vLLM LLM(), disabling CUDAGraphs and "
@@ -1593,6 +1610,7 @@ def main() -> None:
             vllm_force_answer=not args.vllm_no_force_answer,
             vllm_min_tokens=args.vllm_min_tokens,
             vllm_chunk_size=args.vllm_chunk_size,
+            save_completions=args.save_completions,
         )
         benchmark_results[bench_name] = result
 
